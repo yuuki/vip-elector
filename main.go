@@ -289,7 +289,7 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 		// Acquire lock (blocks until acquired or context cancelled)
 		lockCh, err := lock.Lock(ctx.Done())
 		if err != nil {
-			slog.Error("Failed to acquire lock", "error", err)
+			slog.Info("Lock already held by another node, waiting for next election cycle", "error", err)
 			destroySession(client, sessionID)
 			select {
 			case <-time.After(backoff):
