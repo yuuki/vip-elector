@@ -1,0 +1,29 @@
+# Example vip-manager.yml configuration
+# This file is used by both vip-manager and vip-elector
+
+# DCS (Distributed Configuration Store) settings
+dcs-type: consul
+dcs-endpoints:
+  - "http://127.0.0.1:8500"
+
+# Consul key to monitor for leader hostname
+# vip-elector writes the current leader's hostname here
+# vip-manager reads this key and assigns VIP when it matches local hostname
+trigger-key: "network/sakura-internal/vip/lock"
+
+# VIP settings (used only by vip-manager)
+ip: 192.168.227.200
+netmask: 24
+interface: bond0
+
+# How often vip-manager checks the trigger-key (milliseconds)
+interval: 1000
+
+# Optional: Specific value to match (typically omitted to use hostname)
+# trigger-value: "node-a"
+
+# Optional: Retry interval on DCS connection failure (milliseconds)
+# retry-after: 250
+
+# Optional: Number of retries before giving up (-1 = infinite)
+# retry-num: -1

@@ -1,0 +1,56 @@
+[Unit]
+Description=vip-elector - Consul-based leader election for VIP management
+Documentation=https://github.com/yuuki/vip-elector
+After=network-online.target consul.service
+Wants=network-online.target
+Requires=consul.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Environment variables for Consul connection
+# Option 1: Set directly (not recommended for tokens)
+# Environment=CONSUL_HTTP_ADDR=127.0.0.1:8500
+# Environment=CONSUL_HTTP_TOKEN=your-token-here
+
+# Option 2: Use EnvironmentFile (recommended)
+# Create /etc/sysconfig/vip-elector with:
+#   CONSUL_HTTP_TOKEN=your-token-here
+# EnvironmentFile=-/etc/sysconfig/vip-elector
+
+# Option 3: For TLS environments
+# Environment=CONSUL_CACERT=/etc/consul.d/ca.pem
+# Environment=CONSUL_CLIENT_CERT=/etc/consul.d/client.pem
+# Environment=CONSUL_CLIENT_KEY=/etc/consul.d/client-key.pem
+
+ExecStart=/usr/local/bin/vip-elector \
+  --vip-manager-config=/etc/vip-manager.yml \
+  --check-id=vip-http \
+  --ttl=10s \
+  --lock-delay=1s
+
+# Restart policy
+Restart=always
+RestartSec=2
+StartLimitInterval=0
+
+# Security hardening (optional)
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=true
+# ReadWritePaths=/var/run
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vip-elector
+
+# Resource limits (optional)
+# LimitNOFILE=65536
+# LimitNPROC=32768
+
+[Install]
+WantedBy=multi-user.target

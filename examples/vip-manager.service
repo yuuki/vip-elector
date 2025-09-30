@@ -1,0 +1,30 @@
+[Unit]
+Description=vip-manager - Manages VIP based on Consul key
+Documentation=https://github.com/cybertec-postgresql/vip-manager
+After=network-online.target consul.service vip-elector.service
+Wants=network-online.target
+Requires=consul.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# vip-manager reads the same config file as vip-elector
+ExecStart=/usr/local/bin/vip-manager \
+  --config=/etc/vip-manager.yml
+
+Restart=always
+RestartSec=2
+StartLimitInterval=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vip-manager
+
+# Capabilities needed for VIP management
+# AmbientCapabilities=CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
