@@ -20,6 +20,7 @@ var (
 	// Build-time variables (set via -ldflags)
 	version = "0.1.2"
 	commit  = "unknown"
+	date    = "unknown"
 )
 
 const (
@@ -142,7 +143,7 @@ func parseFlags() (*Config, error) {
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Printf("vip-elector version %s (commit: %s, go: %s)\n", version, commit, runtime.Version())
+		fmt.Printf("vip-elector version %s (commit: %s, date: %s, go: %s)\n", version, commit, date, runtime.Version())
 		os.Exit(0)
 	}
 

@@ -23,6 +23,7 @@ builds:
       - -s -w
       - -X main.version={{.Version}}
       - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
 
 archives:
   - id: default
