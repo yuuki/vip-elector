@@ -18,6 +18,9 @@ import (
 const (
 	defaultTTL       = "10s"
 	defaultLockDelay = "1s"
+	// LockFlagValue is the magic flag Consul uses to identify lock keys
+	// See: https://github.com/hashicorp/consul/blob/main/api/lock.go
+	LockFlagValue uint64 = 0x2ddccbc058a50c18
 )
 
 // VipManagerConfig represents the structure of vip-manager.yml
@@ -92,6 +95,11 @@ func run() error {
 			slog.Warn("Health check verification failed", "error", err)
 			slog.Warn("Session will be created without service check - health-based failover will not work")
 		}
+	}
+
+	// Verify trigger-key state before attempting lock acquisition
+	if err := verifyLockKeyState(consulClient, vipMgrConfig.TriggerKey); err != nil {
+		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
 	}
 
 	// Setup signal handling
@@ -217,6 +225,37 @@ func verifyCheckExists(client *api.Client, checkID string) error {
 		return fmt.Errorf("check ID '%s' not found in Consul agent", checkID)
 	}
 
+	return nil
+}
+
+// verifyLockKeyState checks if the trigger-key is compatible with Consul Lock API.
+// Returns an error if a regular KV (non-lock) entry exists at the key path.
+func verifyLockKeyState(client *api.Client, key string) error {
+	kv := client.KV()
+	pair, _, err := kv.Get(key, nil)
+	if err != nil {
+		return fmt.Errorf("failed to query key state: %w", err)
+	}
+
+	// Key doesn't exist - this is fine, Lock will create it
+	if pair == nil {
+		slog.Info("Trigger key does not exist (will be created on first lock acquisition)", "key", key)
+		return nil
+	}
+
+	// Key exists - check if it's a lock key or regular KV
+	if pair.Flags != LockFlagValue {
+		return fmt.Errorf(
+			"existing key at '%s' is a regular KV entry (Flags=%d), not a lock key (expected Flags=%d). "+
+				"This will cause 'ErrLockConflict: Existing key does not match lock use'. "+
+				"Resolution: Run 'consul kv delete %s' before starting vip-elector, or change trigger-key to an unused path. "+
+				"See: https://github.com/hashicorp/consul/blob/main/api/lock.go",
+			key, pair.Flags, LockFlagValue, key,
+		)
+	}
+
+	// Key exists with correct lock flag - this is fine (previous lock)
+	slog.Info("Trigger key exists with correct lock flag", "key", key, "flags", pair.Flags, "session", pair.Session)
 	return nil
 }
 
