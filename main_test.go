@@ -414,3 +414,134 @@ func TestMin(t *testing.T) {
 		})
 	}
 }
+
+// mockKVClient implements a simple in-memory KV for testing
+type mockKVClient struct {
+	data map[string]*api.KVPair
+}
+
+func (m *mockKVClient) Get(key string, q *api.QueryOptions) (*api.KVPair, *api.QueryMeta, error) {
+	if pair, ok := m.data[key]; ok {
+		return pair, &api.QueryMeta{}, nil
+	}
+	return nil, &api.QueryMeta{}, nil
+}
+
+
+// TestVerifyLockKeyState tests the lock key verification logic
+func TestVerifyLockKeyState(t *testing.T) {
+	tests := []struct {
+		name        string
+		key         string
+		existingKV  *api.KVPair
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:       "key does not exist - OK",
+			key:        "test/vip/lock",
+			existingKV: nil,
+			wantErr:    false,
+		},
+		{
+			name: "key exists with correct lock flag - OK",
+			key:  "test/vip/lock",
+			existingKV: &api.KVPair{
+				Key:     "test/vip/lock",
+				Value:   []byte("server01"),
+				Flags:   LockFlagValue,
+				Session: "session-123",
+			},
+			wantErr: false,
+		},
+		{
+			name: "key exists as regular KV (Flags=0) - ERROR",
+			key:  "test/vip/lock",
+			existingKV: &api.KVPair{
+				Key:   "test/vip/lock",
+				Value: []byte("server01"),
+				Flags: 0,
+			},
+			wantErr:     true,
+			errContains: "regular KV entry",
+		},
+		{
+			name: "key exists with wrong flags - ERROR",
+			key:  "test/vip/lock",
+			existingKV: &api.KVPair{
+				Key:   "test/vip/lock",
+				Value: []byte("server01"),
+				Flags: 12345,
+			},
+			wantErr:     true,
+			errContains: "regular KV entry",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup mock client
+			mockKV := &mockKVClient{
+				data: make(map[string]*api.KVPair),
+			}
+			if tt.existingKV != nil {
+				mockKV.data[tt.key] = tt.existingKV
+			}
+
+			// Test
+			err := verifyLockKeyState(mockKV, tt.key)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("expected error to contain %q, got %q", tt.errContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestVerifyLockKeyStateErrorDetails verifies error message details
+func TestVerifyLockKeyStateErrorDetails(t *testing.T) {
+	mockKV := &mockKVClient{
+		data: map[string]*api.KVPair{
+			"test/lock": {
+				Key:   "test/lock",
+				Value: []byte("hostname"),
+				Flags: 0, // Regular KV
+			},
+		},
+	}
+
+	err := verifyLockKeyState(mockKV, "test/lock")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Verify error message contains expected details
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "test/lock") {
+		t.Errorf("expected error to contain key 'test/lock', got %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "Flags=0") {
+		t.Errorf("expected error to contain 'Flags=0', got %s", errMsg)
+	}
+}
+
+// TestLockFlagValue verifies the magic constant matches Consul's implementation
+func TestLockFlagValue(t *testing.T) {
+	// This is the actual value from hashicorp/consul/api/lock.go
+	// https://github.com/hashicorp/consul/blob/main/api/lock.go
+	const expectedValue uint64 = 0x2ddccbc058a50c18
+
+	if LockFlagValue != expectedValue {
+		t.Errorf("LockFlagValue constant mismatch: expected 0x%x (%d), got 0x%x (%d)",
+			expectedValue, expectedValue, LockFlagValue, LockFlagValue)
+	}
+}
