@@ -427,60 +427,6 @@ func (m *mockKVClient) Get(key string, q *api.QueryOptions) (*api.KVPair, *api.Q
 	return nil, &api.QueryMeta{}, nil
 }
 
-// mockConsulClient wraps a mock KV client
-type mockConsulClient struct {
-	kv *mockKVClient
-}
-
-func (m *mockConsulClient) KV() KVClient {
-	return m.kv
-}
-
-// KVClient interface for mocking
-type KVClient interface {
-	Get(key string, q *api.QueryOptions) (*api.KVPair, *api.QueryMeta, error)
-}
-
-// consulClientInterface allows mocking the Consul client
-type consulClientInterface interface {
-	KV() KVClient
-}
-
-// verifyLockKeyStateWithClient is a testable version that accepts an interface
-func verifyLockKeyStateWithClient(client consulClientInterface, key string) error {
-	kv := client.KV()
-	pair, _, err := kv.Get(key, nil)
-	if err != nil {
-		return err
-	}
-
-	// Key doesn't exist - this is fine
-	if pair == nil {
-		return nil
-	}
-
-	// Key exists - check if it's a lock key or regular KV
-	if pair.Flags != LockFlagValue {
-		return &LockKeyConflictError{
-			Key:          key,
-			ActualFlags:  pair.Flags,
-			ExpectedFlags: LockFlagValue,
-		}
-	}
-
-	return nil
-}
-
-// LockKeyConflictError represents a lock key conflict
-type LockKeyConflictError struct {
-	Key           string
-	ActualFlags   uint64
-	ExpectedFlags uint64
-}
-
-func (e *LockKeyConflictError) Error() string {
-	return "lock key conflict"
-}
 
 // TestVerifyLockKeyState tests the lock key verification logic
 func TestVerifyLockKeyState(t *testing.T) {
@@ -517,7 +463,7 @@ func TestVerifyLockKeyState(t *testing.T) {
 				Flags: 0,
 			},
 			wantErr:     true,
-			errContains: "lock key conflict",
+			errContains: "regular KV entry",
 		},
 		{
 			name: "key exists with wrong flags - ERROR",
@@ -528,7 +474,7 @@ func TestVerifyLockKeyState(t *testing.T) {
 				Flags: 12345,
 			},
 			wantErr:     true,
-			errContains: "lock key conflict",
+			errContains: "regular KV entry",
 		},
 	}
 
@@ -541,10 +487,9 @@ func TestVerifyLockKeyState(t *testing.T) {
 			if tt.existingKV != nil {
 				mockKV.data[tt.key] = tt.existingKV
 			}
-			mockClient := &mockConsulClient{kv: mockKV}
 
 			// Test
-			err := verifyLockKeyStateWithClient(mockClient, tt.key)
+			err := verifyLockKeyState(mockKV, tt.key)
 
 			if tt.wantErr {
 				if err == nil {
@@ -552,10 +497,6 @@ func TestVerifyLockKeyState(t *testing.T) {
 				}
 				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
 					t.Errorf("expected error to contain %q, got %q", tt.errContains, err.Error())
-				}
-				// Verify it's the right error type
-				if _, ok := err.(*LockKeyConflictError); !ok {
-					t.Errorf("expected *LockKeyConflictError, got %T", err)
 				}
 			} else {
 				if err != nil {
@@ -577,26 +518,19 @@ func TestVerifyLockKeyStateErrorDetails(t *testing.T) {
 			},
 		},
 	}
-	mockClient := &mockConsulClient{kv: mockKV}
 
-	err := verifyLockKeyStateWithClient(mockClient, "test/lock")
+	err := verifyLockKeyState(mockKV, "test/lock")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 
-	lockErr, ok := err.(*LockKeyConflictError)
-	if !ok {
-		t.Fatalf("expected *LockKeyConflictError, got %T", err)
+	// Verify error message contains expected details
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "test/lock") {
+		t.Errorf("expected error to contain key 'test/lock', got %s", errMsg)
 	}
-
-	if lockErr.Key != "test/lock" {
-		t.Errorf("expected key=test/lock, got %s", lockErr.Key)
-	}
-	if lockErr.ActualFlags != 0 {
-		t.Errorf("expected ActualFlags=0, got %d", lockErr.ActualFlags)
-	}
-	if lockErr.ExpectedFlags != LockFlagValue {
-		t.Errorf("expected ExpectedFlags=%d, got %d", LockFlagValue, lockErr.ExpectedFlags)
+	if !strings.Contains(errMsg, "Flags=0") {
+		t.Errorf("expected error to contain 'Flags=0', got %s", errMsg)
 	}
 }
 

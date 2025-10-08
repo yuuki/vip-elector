@@ -98,7 +98,7 @@ func run() error {
 	}
 
 	// Verify trigger-key state before attempting lock acquisition
-	if err := verifyLockKeyState(consulClient, vipMgrConfig.TriggerKey); err != nil {
+	if err := verifyLockKeyState(consulClient.KV(), vipMgrConfig.TriggerKey); err != nil {
 		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
 	}
 
@@ -228,10 +228,14 @@ func verifyCheckExists(client *api.Client, checkID string) error {
 	return nil
 }
 
+// kvGetter is an interface for getting KV pairs, allowing for testing with mocks
+type kvGetter interface {
+	Get(key string, q *api.QueryOptions) (*api.KVPair, *api.QueryMeta, error)
+}
+
 // verifyLockKeyState checks if the trigger-key is compatible with Consul Lock API.
 // Returns an error if a regular KV (non-lock) entry exists at the key path.
-func verifyLockKeyState(client *api.Client, key string) error {
-	kv := client.KV()
+func verifyLockKeyState(kv kvGetter, key string) error {
 	pair, _, err := kv.Get(key, nil)
 	if err != nil {
 		return fmt.Errorf("failed to query key state: %w", err)
