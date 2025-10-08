@@ -537,9 +537,11 @@ func TestVerifyLockKeyStateErrorDetails(t *testing.T) {
 // TestLockFlagValue verifies the magic constant matches Consul's implementation
 func TestLockFlagValue(t *testing.T) {
 	// This is the actual value from hashicorp/consul/api/lock.go
-	expectedValue := uint64(0x2ddccbc058a50c18)
+	// https://github.com/hashicorp/consul/blob/main/api/lock.go
+	const expectedValue uint64 = 0x2ddccbc058a50c18
 
 	if LockFlagValue != expectedValue {
-		t.Errorf("LockFlagValue mismatch: expected %d, got %d", expectedValue, LockFlagValue)
+		t.Errorf("LockFlagValue constant mismatch: expected 0x%x (%d), got 0x%x (%d)",
+			expectedValue, expectedValue, LockFlagValue, LockFlagValue)
 	}
 }
