@@ -254,6 +254,30 @@ consul operator raft list-peers
 
 ## Troubleshooting
 
+### "Existing key does not match lock use" error
+
+If vip-elector fails to start with an error like:
+
+```
+trigger-key pre-flight check failed: existing key at 'network/sakura-internal/vip/lock' is a regular KV entry (Flags=0), not a lock key (expected Flags=3304740253564472344)
+```
+
+**Cause**: The trigger-key was manually created with `consul kv put` or by another tool, making it a regular KV entry instead of a lock key. Consul's Lock API requires a specific flag value to identify lock keys.
+
+**Resolution**:
+
+1. Delete the existing key:
+   ```bash
+   consul kv delete network/sakura-internal/vip/lock
+   ```
+
+2. Restart vip-elector - it will create the key correctly with lock flags
+
+**Prevention**:
+- **Do NOT pre-create the trigger-key** with `consul kv put`
+- Let vip-elector create and manage the trigger-key automatically
+- The trigger-key is an internal lock mechanism, not a configuration value
+
 ### Lock not acquired
 
 1. Check Consul connectivity:
