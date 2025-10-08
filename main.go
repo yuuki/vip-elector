@@ -7,12 +7,20 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/hashicorp/consul/api"
 	"gopkg.in/yaml.v3"
+)
+
+var (
+	// Build-time variables (set via -ldflags)
+	version = "0.1.2"
+	commit  = "unknown"
+	date    = "unknown"
 )
 
 const (
@@ -123,6 +131,7 @@ func run() error {
 func parseFlags() (*Config, error) {
 	config := &Config{}
 
+	versionFlag := flag.Bool("version", false, "Show version information")
 	flag.StringVar(&config.VipManagerConfigPath, "vip-manager-config", "", "Path to vip-manager.yml (required)")
 	flag.StringVar(&config.CheckID, "check-id", "", "Consul service check ID to associate with session")
 	ttlStr := flag.String("ttl", defaultTTL, "Session TTL (e.g., 10s, 15s)")
@@ -132,6 +141,11 @@ func parseFlags() (*Config, error) {
 	flag.StringVar(&config.Hostname, "hostname", "", "Hostname to use for lock value (defaults to short hostname)")
 
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("vip-elector version %s (commit: %s, date: %s, go: %s)\n", version, commit, date, runtime.Version())
+		os.Exit(0)
+	}
 
 	if config.VipManagerConfigPath == "" {
 		return nil, fmt.Errorf("--vip-manager-config is required")
