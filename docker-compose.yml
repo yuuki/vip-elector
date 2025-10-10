@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  consul:
+    image: hashicorp/consul:1.20
+    container_name: vip-elector-consul
+    ports:
+      - "8500:8500"
+    command: agent -dev -client=0.0.0.0 -ui
+    environment:
+      - CONSUL_BIND_INTERFACE=eth0
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
