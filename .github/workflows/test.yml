@@ -7,7 +7,8 @@ on:
   pull_request:
 
 jobs:
-  test:
+  unit-test:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,5 +19,41 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run tests
-        run: go test -v ./...
+      - name: Run unit tests
+        run: go test -v -race ./... -tags='!e2e'
+
+  e2e-test:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    services:
+      consul:
+        image: hashicorp/consul:1.20
+        ports:
+          - 8500:8500
+        options: >-
+          --health-cmd "consul members"
+          --health-interval 2s
+          --health-timeout 1s
+          --health-retries 10
+        env:
+          CONSUL_BIND_INTERFACE: eth0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Wait for Consul
+        run: |
+          echo "Waiting for Consul to be ready..."
+          timeout 30 sh -c 'until curl -sf http://localhost:8500/v1/status/leader >/dev/null; do sleep 1; done'
+          echo "Consul is ready"
+
+      - name: Run E2E tests
+        run: go test -v -race -tags=e2e ./e2e/... -timeout=5m
+        env:
+          CONSUL_HTTP_ADDR: localhost:8500

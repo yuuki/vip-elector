@@ -1,0 +1,15 @@
+# Test configuration for E2E tests
+# Used by vip-elector during integration tests
+
+dcs-type: consul
+dcs-endpoints:
+  - "http://127.0.0.1:8500"
+
+# Trigger key for testing
+trigger-key: "test/vip-elector/e2e/lock"
+
+# VIP settings (not used by vip-elector, but required for vip-manager.yml format)
+ip: 192.168.100.100
+netmask: 24
+interface: lo
+interval: 1000
