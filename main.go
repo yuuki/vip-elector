@@ -19,7 +19,7 @@ import (
 
 var (
 	// Build-time variables (set via -ldflags)
-	version = "0.1.4"
+	version = "0.1.5"
 	commit  = "unknown"
 	date    = "unknown"
 )
