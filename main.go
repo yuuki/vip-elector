@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,9 @@ var (
 const (
 	defaultTTL       = "10s"
 	defaultLockDelay = "1s"
+	// Retry lock monitoring briefly on Consul 500/transient unavailability.
+	defaultMonitorRetries   = 3
+	defaultMonitorRetryTime = 10 * time.Second
 	// LockFlagValue is the magic flag Consul uses to identify lock keys
 	// See: https://github.com/hashicorp/consul/blob/main/api/lock.go
 	LockFlagValue uint64 = 0x2ddccbc058a50c18
@@ -48,6 +52,14 @@ type Config struct {
 	ConsulToken          string
 	Hostname             string
 }
+
+type lockAcquireErrorType string
+
+const (
+	lockAcquireErrorConflict        lockAcquireErrorType = "lock_conflict"
+	lockAcquireErrorConsulRetryable lockAcquireErrorType = "consul_retryable"
+	lockAcquireErrorUnknown         lockAcquireErrorType = "lock_unknown"
+)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -323,13 +335,7 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 		backoff = time.Second
 
 		// Try to acquire lock
-		lock, err := client.LockOpts(&api.LockOptions{
-			Key:   vipMgrConfig.TriggerKey,
-			Value: []byte(hostname),
-			SessionOpts: &api.SessionEntry{
-				ID: sessionID,
-			},
-		})
+		lock, err := client.LockOpts(buildLockOptions(vipMgrConfig.TriggerKey, hostname, sessionID))
 		if err != nil {
 			slog.Error("Failed to create lock", "error", err)
 			// Destroy session
@@ -346,7 +352,17 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 		// Acquire lock (blocks until acquired or context cancelled)
 		lockCh, err := lock.Lock(ctx.Done())
 		if err != nil {
-			slog.Info("Lock already held by another node, waiting for next election cycle", "error", err)
+			errorType := classifyLockAcquireError(err)
+			switch errorType {
+			case lockAcquireErrorConflict:
+				destroySession(client, sessionID)
+				return fmt.Errorf("lock acquisition failed (%s): %w", errorType, err)
+			case lockAcquireErrorConsulRetryable:
+				slog.Warn("Lock acquisition failed", "error_type", errorType, "error", err)
+			default:
+				slog.Error("Lock acquisition failed", "error_type", errorType, "error", err)
+			}
+
 			destroySession(client, sessionID)
 			select {
 			case <-time.After(backoff):
@@ -405,6 +421,30 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 			return nil
 		}
 	}
+}
+
+func buildLockOptions(triggerKey, hostname, sessionID string) *api.LockOptions {
+	return &api.LockOptions{
+		Key:   triggerKey,
+		Value: []byte(hostname),
+		SessionOpts: &api.SessionEntry{
+			ID: sessionID,
+		},
+		// Retry monitor checks briefly so transient Consul 500 errors do not
+		// immediately trigger lock-loss handling.
+		MonitorRetries:   defaultMonitorRetries,
+		MonitorRetryTime: defaultMonitorRetryTime,
+	}
+}
+
+func classifyLockAcquireError(err error) lockAcquireErrorType {
+	if errors.Is(err, api.ErrLockConflict) {
+		return lockAcquireErrorConflict
+	}
+	if api.IsRetryableError(err) {
+		return lockAcquireErrorConsulRetryable
+	}
+	return lockAcquireErrorUnknown
 }
 
 func createSession(client *api.Client, config *Config, name string) (string, error) {

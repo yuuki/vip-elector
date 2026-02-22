@@ -229,6 +229,8 @@ Network partition or node crash → Consul agent disconnects → Session invalid
 
 - `INFO: *** LOCK ACQUIRED ***` - This node became leader
 - `WARN: *** LOCK LOST ***` - Lost leadership, re-entering election
+- `WARN: Lock acquisition failed (error_type=consul_retryable)` - Transient Consul unavailability; vip-elector will retry
+- `ERROR: Lock acquisition failed (error_type=lock_conflict)` - Trigger key is incompatible with Lock API; process exits
 - `ERROR: Failed to create session` - Consul connectivity issues
 - `WARN: Health check verification failed` - Check ID not found
 
@@ -296,6 +298,39 @@ trigger-key pre-flight check failed: existing key at 'network/sakura-internal/vi
    consul acl token read -self
    ```
 
+### Consul 500 / i/o deadline reached during lock acquisition
+
+If vip-elector logs include `Lock acquisition failed` with `error_type=consul_retryable`,
+the failure is usually a transient Consul-side problem (for example: leader election, RPC timeout, or network jitter),
+not a confirmed lock contention with another node.
+
+Example log pattern:
+
+```json
+{"level":"WARN","msg":"Lock acquisition failed","error_type":"consul_retryable","error":"failed to read lock: Unexpected response code: 500 (... i/o deadline reached)"}
+```
+
+In this case vip-elector will:
+
+1. Destroy the current session
+2. Retry lock acquisition with backoff
+3. Continue leader election when Consul recovers
+
+What to check:
+
+1. Consul membership and raft leadership stability:
+   ```bash
+   consul members
+   consul operator raft list-peers
+   ```
+2. Consul agent/server logs around the same timestamp for timeout or election events.
+3. All components are watching the same trigger key (`<trigger-key>`).
+4. vip-manager status/logs, because L2 neighbor updates (including gratuitous ARP) are vip-manager's responsibility:
+   ```bash
+   sudo systemctl status vip-manager
+   sudo journalctl -u vip-manager -f
+   ```
+
 ### Frequent failovers (flapping)
 
 - Increase `--lock-delay` (e.g., `2s` or `5s`)
@@ -317,6 +352,9 @@ trigger-key pre-flight check failed: existing key at 'network/sakura-internal/vi
 3. Ensure vip-manager is monitoring the same trigger-key as vip-elector.
 
 4. Verify vip-manager configuration matches vip-elector's vip-manager.yml.
+
+5. Confirm vip-manager is configured correctly for post-switch L2 announcements.
+   vip-elector handles leader election and trigger-key updates only.
 
 ## Design Considerations
 
