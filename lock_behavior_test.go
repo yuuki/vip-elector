@@ -68,7 +68,7 @@ func TestBuildLockOptions(t *testing.T) {
 	if opts.MonitorRetries != 3 {
 		t.Errorf("expected MonitorRetries=3, got %d", opts.MonitorRetries)
 	}
-	if opts.MonitorRetryTime != 2*time.Second {
-		t.Errorf("expected MonitorRetryTime=2s, got %v", opts.MonitorRetryTime)
+	if opts.MonitorRetryTime != 10*time.Second {
+		t.Errorf("expected MonitorRetryTime=10s, got %v", opts.MonitorRetryTime)
 	}
 }

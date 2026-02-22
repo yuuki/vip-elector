@@ -29,7 +29,7 @@ const (
 	defaultLockDelay = "1s"
 	// Retry lock monitoring briefly on Consul 500/transient unavailability.
 	defaultMonitorRetries   = 3
-	defaultMonitorRetryTime = 2 * time.Second
+	defaultMonitorRetryTime = 10 * time.Second
 	// LockFlagValue is the magic flag Consul uses to identify lock keys
 	// See: https://github.com/hashicorp/consul/blob/main/api/lock.go
 	LockFlagValue uint64 = 0x2ddccbc058a50c18
