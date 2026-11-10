@@ -30,7 +30,7 @@ The program follows a single-file architecture with a clear execution flow:
    - Renews the session TTL in the background (`startSessionKeepalive` / `renewSession`)
    - Acquires KV lock with hostname as the value, using that session (`LockOptions.Session`)
    - Blocks on `lockCh` (lock lost) and `keepalive.lost` (session gone) to detect loss of leadership
-   - Destroys the session whenever leadership is given up, so the key is always deleted
+   - Destroys the session whenever leadership is given up, so the key is deleted. A destroy that fails (Consul unreachable) is retried before the next attempt; otherwise the session expires with its TTL
    - Implements exponential backoff (1s → 30s) for retry resilience
 
 3. **Session Configuration** (`createSession`):
@@ -93,7 +93,8 @@ Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 ### Session Ownership and Renewal
 - The lock must be held by the session `createSession` returns. Pass it as `LockOptions.Session`; `LockOptions.SessionOpts` makes the Lock API create a second, default session (no TTL, no service check, `Behavior: release`) and ignores the ID
 - The Lock API only renews sessions it creates itself, so vip-elector renews the TTL every TTL/2
-- A renew answer of "session not found" means leadership is lost; other renew errors are retried
+- A renew answer of "session not found" means leadership is lost; other renew errors are retried indefinitely (leadership is not given up while Consul is unreachable)
+- `--ttl` must be > 0 (Consul treats 0 as "never expires"). `--lock-delay=0s` is sent as 1ms because the Consul client drops a zero value and the server would apply its 15s default
 
 ### Graceful Shutdown
 - SIGINT/SIGTERM trigger context cancellation
@@ -139,4 +140,4 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 - Unit tests: `make test` (`main_test.go`, `lock_behavior_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
 - E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
-- E2E scenarios include: lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key
+- E2E scenarios include: lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session

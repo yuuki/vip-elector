@@ -5,6 +5,9 @@ package e2e
 import (
 	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -58,6 +61,9 @@ func waitForKeyDeleted(t *testing.T, client *api.Client, timeout time.Duration) 
 	for {
 		select {
 		case <-ctx.Done():
+			if last == nil {
+				t.Fatal("Timeout waiting for key deletion: key could not be read")
+			}
 			t.Fatalf("Timeout waiting for key deletion: value=%q session=%q", string(last.Value), last.Session)
 		case <-ticker.C:
 			pair, _, err := client.KV().Get(triggerKey, nil)
@@ -229,4 +235,190 @@ func TestGracefulShutdownDeletesKey(t *testing.T) {
 	}
 
 	waitForKeyDeleted(t, client, 10*time.Second)
+}
+
+// sessionExists reports whether Consul still knows the session.
+func sessionExists(t *testing.T, client *api.Client, id string) bool {
+	t.Helper()
+
+	entry, _, err := client.Session().Info(id, nil)
+	if err != nil {
+		t.Fatalf("Failed to get session info: %v", err)
+	}
+	return entry != nil
+}
+
+// liveSessionNamed returns the ID of a session with the given name, or "".
+func liveSessionNamed(t *testing.T, client *api.Client, name string) string {
+	t.Helper()
+
+	sessions, _, err := client.Session().List(nil)
+	if err != nil {
+		t.Fatalf("Failed to list sessions: %v", err)
+	}
+	for _, s := range sessions {
+		if s.Name == name {
+			return s.ID
+		}
+	}
+	return ""
+}
+
+// TestLockLossDestroysSession verifies that vip-elector destroys its session
+// when it loses the lock while the session itself is still valid, and
+// re-enters the election with a new one. A session that is merely abandoned
+// would linger until its TTL expires.
+func TestLockLossDestroysSession(t *testing.T) {
+	client := setupConsulClient(t)
+
+	_, cleanup := startElector(t, "node1", "")
+	defer cleanup()
+
+	before := waitForLeaderValue(t, client, "node1", 10*time.Second)
+
+	// Take the lock away without touching the session.
+	t.Log("Deleting the lock key")
+	if _, err := client.KV().Delete(triggerKey, nil); err != nil {
+		t.Fatalf("Failed to delete key: %v", err)
+	}
+
+	// Well below the 10s TTL, so an abandoned session would still exist.
+	deadline := time.Now().Add(5 * time.Second)
+	for sessionExists(t, client, before.Session) {
+		if time.Now().After(deadline) {
+			t.Fatalf("Session %s still exists after the lock was lost", before.Session)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	after := waitForLeaderValue(t, client, "node1", 15*time.Second)
+	if after.Session == before.Session {
+		t.Errorf("Expected a new session after re-election, still %s", after.Session)
+	}
+}
+
+// TestStandbySessionLossReentersElection verifies that a standby whose
+// session is invalidated while it waits for the lock notices it, gives up
+// the dead session and creates a new one once it is healthy again. Without
+// that, it would keep waiting with a session that can never acquire.
+func TestStandbySessionLossReentersElection(t *testing.T) {
+	client := setupConsulClient(t)
+	checkID := registerTTLCheck(t, client, "vip-elector-e2e-standby")
+
+	_, cleanup1 := startElector(t, "node1", "")
+	defer cleanup1()
+
+	leader := waitForLeaderValue(t, client, "node1", 10*time.Second)
+
+	_, cleanup2 := startElector(t, "node2", checkID)
+	defer cleanup2()
+
+	var first string
+	deadline := time.Now().Add(10 * time.Second)
+	for first == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("Standby node2 never created a session")
+		}
+		time.Sleep(100 * time.Millisecond)
+		first = liveSessionNamed(t, client, "vip-elector-node2")
+	}
+
+	t.Log("Marking the standby's health check as critical")
+	if err := client.Agent().UpdateTTL(checkID, "e2e failure", api.HealthCritical); err != nil {
+		t.Fatalf("Failed to update check: %v", err)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for sessionExists(t, client, first) {
+		if time.Now().After(deadline) {
+			t.Fatalf("Standby session %s was not invalidated by the critical check", first)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Log("Marking the standby's health check as passing again")
+	if err := client.Agent().UpdateTTL(checkID, "e2e recovered", api.HealthPassing); err != nil {
+		t.Fatalf("Failed to update check: %v", err)
+	}
+
+	// The standby notices within TTL/2, but the pending lock attempt only
+	// returns when its blocking query does (up to 15s).
+	var second string
+	deadline = time.Now().Add(40 * time.Second)
+	for second == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("Standby node2 did not create a new session after losing the first one")
+		}
+		time.Sleep(200 * time.Millisecond)
+		second = liveSessionNamed(t, client, "vip-elector-node2")
+	}
+	if second == first {
+		t.Errorf("Expected a new standby session, still %s", second)
+	}
+
+	// The leader must be unaffected throughout.
+	pair, _, err := client.KV().Get(triggerKey, nil)
+	if err != nil {
+		t.Fatalf("Failed to get key: %v", err)
+	}
+	if pair == nil || pair.Session != leader.Session || string(pair.Value) != "node1" {
+		t.Errorf("Leader changed while the standby recovered: %+v", pair)
+	}
+}
+
+// TestZeroLockDelay verifies that --lock-delay=0s is not replaced by Consul's
+// 15s default.
+func TestZeroLockDelay(t *testing.T) {
+	client := setupConsulClient(t)
+
+	configPath, err := filepath.Abs(testConfigPath)
+	if err != nil {
+		t.Fatalf("Failed to get absolute config path: %v", err)
+	}
+
+	cmd := exec.Command("./"+binaryName,
+		"--vip-manager-config="+configPath,
+		"--hostname=node1",
+		"--lock-delay=0s",
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Failed to start elector: %v", err)
+	}
+	defer func() {
+		cmd.Process.Signal(os.Interrupt)
+		cmd.Wait()
+	}()
+
+	pair := waitForLeaderValue(t, client, "node1", 10*time.Second)
+
+	session, _, err := client.Session().Info(pair.Session, nil)
+	if err != nil || session == nil {
+		t.Fatalf("Failed to get session info: %v (session=%v)", err, session)
+	}
+	if session.LockDelay > time.Millisecond {
+		t.Errorf("Expected LockDelay of at most 1ms for --lock-delay=0s, got %v", session.LockDelay)
+	}
+}
+
+// TestRejectsZeroTTL verifies that a TTL which Consul would treat as
+// "never expires" is refused at startup.
+func TestRejectsZeroTTL(t *testing.T) {
+	configPath, err := filepath.Abs(testConfigPath)
+	if err != nil {
+		t.Fatalf("Failed to get absolute config path: %v", err)
+	}
+
+	output, err := exec.Command("./"+binaryName,
+		"--vip-manager-config="+configPath,
+		"--hostname=node1",
+		"--ttl=0s",
+	).CombinedOutput()
+	if err == nil {
+		t.Fatal("Expected elector to refuse --ttl=0s, but it started")
+	}
+	if !strings.Contains(string(output), "invalid --ttl") {
+		t.Errorf("Expected 'invalid --ttl' in output, got: %s", output)
+	}
 }

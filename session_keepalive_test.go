@@ -16,6 +16,8 @@ type mockSessionRenewer struct {
 	mu      sync.Mutex
 	results []renewResult
 	calls   int
+	// noDeadline counts Renew calls that carried no request deadline.
+	noDeadline int
 }
 
 type renewResult struct {
@@ -28,6 +30,11 @@ func (m *mockSessionRenewer) Renew(id string, q *api.WriteOptions) (*api.Session
 	defer m.mu.Unlock()
 
 	m.calls++
+	if q == nil {
+		m.noDeadline++
+	} else if _, ok := q.Context().Deadline(); !ok {
+		m.noDeadline++
+	}
 	if len(m.results) == 0 {
 		return &api.SessionEntry{ID: id}, nil, nil
 	}
@@ -53,6 +60,15 @@ func waitForCalls(t *testing.T, m *mockSessionRenewer, want int) {
 	}
 }
 
+// testContext bounds a test so that a renew loop that never ends fails the
+// test instead of hanging the suite.
+func testContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func TestRenewSession_ReturnsExpiredWhenSessionGone(t *testing.T) {
 	// Renew returns (nil, nil) when Consul answers 404 for the session.
 	renewer := &mockSessionRenewer{results: []renewResult{
@@ -60,7 +76,7 @@ func TestRenewSession_ReturnsExpiredWhenSessionGone(t *testing.T) {
 		{entry: nil},
 	}}
 
-	err := renewSession(context.Background(), renewer, "s1", 10*time.Millisecond)
+	err := renewSession(testContext(t), renewer, "s1", 10*time.Millisecond)
 	if !errors.Is(err, api.ErrSessionExpired) {
 		t.Fatalf("expected ErrSessionExpired, got %v", err)
 	}
@@ -79,7 +95,7 @@ func TestRenewSession_RetriesTransientErrors(t *testing.T) {
 
 	// A transient error must not be reported as a lost session; only the
 	// final "session gone" answer ends the loop.
-	err := renewSession(context.Background(), renewer, "s1", 10*time.Millisecond)
+	err := renewSession(testContext(t), renewer, "s1", 10*time.Millisecond)
 	if !errors.Is(err, api.ErrSessionExpired) {
 		t.Fatalf("expected ErrSessionExpired, got %v", err)
 	}
@@ -174,5 +190,72 @@ func TestSessionKeepalive_ParentCancelDoesNotSignalLost(t *testing.T) {
 	case <-k.lost:
 		t.Error("lost must not be closed on shutdown")
 	default:
+	}
+}
+
+func TestRenewSession_RequestsCarryDeadline(t *testing.T) {
+	renewer := &mockSessionRenewer{results: []renewResult{
+		{entry: &api.SessionEntry{ID: "s1"}},
+		{entry: nil},
+	}}
+
+	if err := renewSession(testContext(t), renewer, "s1", 10*time.Millisecond); !errors.Is(err, api.ErrSessionExpired) {
+		t.Fatalf("expected ErrSessionExpired, got %v", err)
+	}
+
+	// Without a deadline a hung Consul would block renewal indefinitely.
+	if renewer.noDeadline != 0 {
+		t.Errorf("expected every Renew call to carry a deadline, %d did not", renewer.noDeadline)
+	}
+}
+
+func TestRenewSession_FollowsServerTTL(t *testing.T) {
+	// The server answers with a much longer TTL than requested; the loop
+	// must slow down to TTL/2 of the server value.
+	renewer := &mockSessionRenewer{results: []renewResult{
+		{entry: &api.SessionEntry{ID: "s1", TTL: "1h"}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- renewSession(ctx, renewer, "s1", 10*time.Millisecond)
+	}()
+
+	waitForCalls(t, renewer, 1)
+	time.Sleep(100 * time.Millisecond)
+	if got := renewer.callCount(); got != 1 {
+		t.Errorf("expected 1 Renew call after the server raised the TTL, got %d", got)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Errorf("expected nil on cancellation, got %v", err)
+	}
+}
+
+func TestRenewSession_ZeroTTLDoesNotSpin(t *testing.T) {
+	renewer := &mockSessionRenewer{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- renewSession(ctx, renewer, "s1", 0)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if got := renewer.callCount(); got != 0 {
+		t.Errorf("expected no Renew calls for a zero TTL, got %d", got)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("expected nil on cancellation, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("renewSession did not return after context cancellation")
 	}
 }

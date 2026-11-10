@@ -176,12 +176,31 @@ func parseFlags() (*Config, error) {
 		return nil, fmt.Errorf("invalid --lock-delay: %w", err)
 	}
 
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+
 	// Get token from environment if not specified
 	if config.ConsulToken == "" {
 		config.ConsulToken = os.Getenv("CONSUL_HTTP_TOKEN")
 	}
 
 	return config, nil
+}
+
+// validateConfig rejects flag values that would silently change how the
+// session behaves.
+func validateConfig(config *Config) error {
+	// Consul treats a zero TTL as "no TTL": the session would never expire,
+	// so a killed vip-elector would keep the lock for as long as the node is
+	// healthy.
+	if config.TTL <= 0 {
+		return fmt.Errorf("invalid --ttl: must be greater than 0 (Consul requires at least 10s by default), got %s", config.TTL)
+	}
+	if config.LockDelay < 0 {
+		return fmt.Errorf("invalid --lock-delay: must not be negative, got %s", config.LockDelay)
+	}
+	return nil
 }
 
 func loadVipManagerConfig(path string) (*VipManagerConfig, error) {
@@ -307,6 +326,12 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 
+	// Sessions we gave up on but could not destroy (Consul unreachable).
+	// Such a session may still own the key, so it is destroyed before a new
+	// attempt; otherwise the new session would queue behind our own stale
+	// one until its TTL expires.
+	var staleSessions []string
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -314,6 +339,8 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 			return nil
 		default:
 		}
+
+		staleSessions = destroySessions(client, staleSessions)
 
 		slog.Info("Attempting to create session and acquire lock")
 
@@ -342,11 +369,15 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 
 		// giveUp ends this attempt: stop renewing and destroy the session.
 		// Destroying it is what releases leadership: Behavior=delete removes
-		// the key and lock-delay keeps other nodes out until vip-manager on
-		// this node has had time to drop the VIP.
+		// the key, and lock-delay holds other nodes off so that vip-manager
+		// on this node gets time to drop the VIP. If the destroy fails the
+		// session is retried on the next attempt, and expires with its TTL
+		// if the process exits first.
 		giveUp := func() {
 			keepalive.stop()
-			destroySession(client, sessionID)
+			if !destroySession(client, sessionID) {
+				staleSessions = append(staleSessions, sessionID)
+			}
 		}
 
 		// Try to acquire lock
@@ -420,7 +451,8 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 		}
 
 		// Leadership is gone as far as we can tell. Make sure Consul agrees
-		// before trying again, so a stale session can never keep the key.
+		// before trying again, so a session we no longer watch does not keep
+		// the key.
 		giveUp()
 
 		// Small delay before re-election to avoid tight loop
@@ -509,6 +541,13 @@ func (k *sessionKeepalive) stop() {
 // if Consul stays unreachable past the TTL the session expires server-side,
 // which the next successful request reports.
 func renewSession(ctx context.Context, renewer sessionRenewer, sessionID string, ttl time.Duration) error {
+	if ttl <= 0 {
+		// A session without TTL needs no renewal. validateConfig rejects
+		// this; never spin if it gets here anyway.
+		<-ctx.Done()
+		return nil
+	}
+
 	interval := ttl / 2
 	wait := interval
 
@@ -544,12 +583,20 @@ func renewSession(ctx context.Context, renewer sessionRenewer, sessionID string,
 	}
 }
 
-func createSession(client *api.Client, config *Config, name string) (string, error) {
+func buildSessionEntry(config *Config, name string) *api.SessionEntry {
+	lockDelay := config.LockDelay
+	if lockDelay == 0 {
+		// The Consul client omits a zero LockDelay from the request and the
+		// server then applies its 15s default. Send the smallest value the
+		// API can express so that --lock-delay=0s means "no delay".
+		lockDelay = time.Millisecond
+	}
+
 	sessionEntry := &api.SessionEntry{
 		Name:      fmt.Sprintf("vip-elector-%s", name),
 		Behavior:  "delete",
 		TTL:       config.TTL.String(),
-		LockDelay: config.LockDelay,
+		LockDelay: lockDelay,
 		Checks:    []string{"serfHealth"},
 	}
 
@@ -560,7 +607,11 @@ func createSession(client *api.Client, config *Config, name string) (string, err
 		}
 	}
 
-	sessionID, _, err := client.Session().Create(sessionEntry, nil)
+	return sessionEntry
+}
+
+func createSession(client *api.Client, config *Config, name string) (string, error) {
+	sessionID, _, err := client.Session().Create(buildSessionEntry(config, name), nil)
 	if err != nil {
 		return "", err
 	}
@@ -568,7 +619,21 @@ func createSession(client *api.Client, config *Config, name string) (string, err
 	return sessionID, nil
 }
 
-func destroySession(client *api.Client, sessionID string) {
+// destroySessions destroys each session and returns the ones that could not
+// be destroyed.
+func destroySessions(client *api.Client, sessionIDs []string) []string {
+	var remaining []string
+	for _, id := range sessionIDs {
+		if !destroySession(client, id) {
+			remaining = append(remaining, id)
+		}
+	}
+	return remaining
+}
+
+// destroySession destroys the session and reports whether Consul confirmed
+// it. Destroying a session that no longer exists counts as success.
+func destroySession(client *api.Client, sessionID string) bool {
 	// Use independent context with timeout for session destruction
 	destroyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -579,9 +644,10 @@ func destroySession(client *api.Client, sessionID string) {
 	_, err := client.Session().Destroy(sessionID, opts)
 	if err != nil {
 		slog.Error("Failed to destroy session", "session_id", sessionID, "error", err)
-	} else {
-		slog.Info("Session destroyed", "session_id", sessionID)
+		return false
 	}
+	slog.Info("Session destroyed", "session_id", sessionID)
+	return true
 }
 
 func min(a, b time.Duration) time.Duration {

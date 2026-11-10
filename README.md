@@ -100,10 +100,11 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
 ```
 --vip-manager-config  Path to vip-manager.yml (required)
 --check-id            Consul service check ID to link to session (e.g., vip-http)
---ttl                 Session TTL (default: 10s, Consul's minimum). Renewed every TTL/2
-                      while vip-elector runs; bounds failover time when the process dies
+--ttl                 Session TTL (default: 10s, Consul's minimum; must be > 0).
+                      Renewed every TTL/2 while vip-elector runs. If the process dies,
+                      Consul expires the session after up to twice the TTL
 --lock-delay          Time other nodes must wait after the leader's session ends
-                      before they can acquire the lock (default: 1s)
+                      before they can acquire the lock (default: 1s, 0s = no delay)
 --addr                Consul address (overrides config and CONSUL_HTTP_ADDR)
 --token               Consul ACL token (overrides CONSUL_HTTP_TOKEN)
 --hostname            Hostname to write to lock value (defaults to short hostname)
@@ -211,7 +212,7 @@ t4: Node B acquires lock, writes "node-b"
 t5: vip-manager (https://github.com/cybertec-postgresql/vip-manager) on B detects match → assigns VIP to B
 ```
 
-**Expected time**: 2-10 seconds (depends on check interval, lock delay, and vip-manager interval). A standby that is refused during the lock delay retries after 5 seconds (fixed by the Consul Lock API).
+**Expected time**: about 5 seconds after Consul marks the check critical, plus the check interval before that and vip-manager's interval after. The key is deleted immediately, but a standby is refused once during the lock delay and retries after 5 seconds (fixed by the Consul Lock API).
 
 ### 2. Process Stop
 
@@ -221,7 +222,7 @@ sudo systemctl stop vip-elector  # on current leader
 
 vip-elector destroys its session → trigger-key deleted → Failover to standby node after the lock delay (about 5 seconds, see above)
 
-If the process is killed without a chance to clean up (`SIGKILL`, crash), the session is no longer renewed and Consul expires it after the TTL (Consul allows up to twice the TTL), then failover proceeds as above.
+If the process is killed without a chance to clean up (`SIGKILL`, crash), the session is no longer renewed and Consul expires it after up to twice the TTL, then failover proceeds as above. With the default `--ttl=10s` expect roughly 25 seconds in total.
 
 ### 3. Node Failure
 
@@ -235,7 +236,10 @@ Network partition or node crash → Consul agent disconnects → Session invalid
 - `WARN: *** LOCK LOST ***` - Lost leadership, re-entering election
 - `WARN: Lock acquisition failed (error_type=consul_retryable)` - Transient Consul unavailability; vip-elector will retry
 - `ERROR: Lock acquisition failed (error_type=lock_conflict)` - Trigger key is incompatible with Lock API; process exits
+- `WARN: SESSION LOST` - Consul reports the session no longer exists; re-entering election
+- `WARN: Failed to renew session, retrying` - Consul did not answer a TTL renewal; retried every second
 - `ERROR: Failed to create session` - Consul connectivity issues
+- `ERROR: Failed to destroy session` - Consul did not confirm the session was destroyed; retried on the next election attempt, otherwise the session expires with its TTL
 - `WARN: Health check verification failed` - Check ID not found
 
 ### Verification
@@ -366,11 +370,13 @@ What to check:
 
 When a session invalidates, the KV entry is deleted. This ensures vip-manager sees an empty value (≠ hostname), preventing the old leader from holding the VIP.
 
-vip-elector gives up leadership the same way in every case (health check failure, lock loss, shutdown): the session ends and the key is deleted. The key is never handed over with the old hostname still in it, so the old leader's vip-manager drops the VIP before another node can acquire the lock.
+vip-elector gives up leadership the same way in every case (health check failure, lock loss, shutdown): the session ends and the key is deleted. The key is never handed over with the old hostname still in it, so the old leader's vip-manager stops seeing its own hostname as soon as leadership ends.
+
+This is not a fencing guarantee. The old leader's vip-manager still needs up to its `interval` to notice the deleted key, and longer if it cannot reach Consul. The lock delay (see below) is what keeps other nodes out meanwhile.
 
 ### Session TTL and renewal
 
-The lock is held by the session vip-elector creates (`Behavior: delete`, `--ttl`, `--lock-delay`, `serfHealth` and `--check-id`). vip-elector renews it every TTL/2. If Consul reports the session no longer exists, vip-elector treats that as loss of leadership and re-enters the election. Transient renew errors are retried; if Consul stays unreachable for longer than the TTL the session may expire server-side.
+The lock is held by the session vip-elector creates (`Behavior: delete`, `--ttl`, `--lock-delay`, `serfHealth` and `--check-id`). vip-elector renews it every TTL/2. If Consul reports the session no longer exists, vip-elector treats that as loss of leadership and re-enters the election. Renew errors are retried for as long as Consul does not answer: vip-elector does not give up leadership on its own while Consul is unreachable, and learns whether the session expired once Consul answers again.
 
 ### Short hostname vs FQDN
 
@@ -382,10 +388,11 @@ By default, vip-elector uses the short hostname (before first dot). Override wit
 
 ### Lock Delay
 
-`--lock-delay` keeps other nodes from acquiring the lock right after the leader's session ends. This gives vip-manager on the old leader time to notice the deleted key and remove the VIP before a new leader announces it, so it should not be shorter than vip-manager's `interval`. It also reduces flapping, but adds delay to failover. Balance based on your requirements:
+`--lock-delay` keeps other nodes from acquiring the lock right after the leader's session ends. This gives vip-manager on the old leader time to notice the deleted key and remove the VIP before a new leader announces it. It also reduces flapping.
 
-- Low latency requirement: `0s` to `1s`
-- Stability priority: `2s` to `5s`
+- Keep it longer than vip-manager's `interval`. The default `1s` equals vip-manager's default interval and leaves no margin for a node that starts contending at that moment.
+- A standby that was already waiting is refused once during the lock delay and retries 5 seconds later (fixed by the Consul Lock API), so any value up to `5s` gives the same failover time for it.
+- `0s` disables the delay: a standby can then take over before the old leader's vip-manager has removed the VIP.
 
 ## Comparison with Alternatives
 
