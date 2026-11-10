@@ -17,6 +17,9 @@ ExecStart=/usr/local/bin/vip-manager \
 # vip-manager only handles SIGINT. With systemd's default SIGTERM it exits
 # without removing the VIP from the interface.
 KillSignal=SIGINT
+# vip-manager 4.0.0 removes the VIP on SIGINT but then does not exit while the
+# trigger key is absent (no leader). Do not wait the default 90s for that.
+TimeoutStopSec=5
 
 Restart=always
 RestartSec=2
