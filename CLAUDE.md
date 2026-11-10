@@ -24,14 +24,16 @@ The program follows a single-file architecture with a clear execution flow:
    - vip-manager.yml overrides environment variables
    - Environment variables are the fallback
 
-2. **Election Loop** (lines 229-310 in `runElectionLoop`):
+2. **Election Loop** (`runElectionLoop`):
    - Creates Consul Session with `Behavior: "delete"` so keys are auto-cleaned on session invalidation
    - Session includes `ServiceChecks` to tie leader election to HTTP health status
-   - Acquires KV lock with hostname as the value
-   - Blocks on `lockCh` to detect lock loss
+   - Renews the session TTL in the background (`startSessionKeepalive` / `renewSession`)
+   - Acquires KV lock with hostname as the value, using that session (`LockOptions.Session`)
+   - Blocks on `lockCh` (lock lost) and `keepalive.lost` (session gone) to detect loss of leadership
+   - Destroys the session whenever leadership is given up, so the key is always deleted
    - Implements exponential backoff (1s → 30s) for retry resilience
 
-3. **Session Configuration** (lines 312-334 in `createSession`):
+3. **Session Configuration** (`createSession`):
    - Always includes `serfHealth` check (Consul agent health)
    - Optionally includes service check ID (via `--check-id`) for HTTP health integration
    - Uses `Behavior: "delete"` to ensure clean failover (key deletion on session loss)
@@ -88,11 +90,15 @@ consul agent -dev  # In another terminal
 Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml > `CONSUL_HTTP_ADDR` env
 Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 
-### Graceful Shutdown (lines 97-104, 298-304)
+### Session Ownership and Renewal
+- The lock must be held by the session `createSession` returns. Pass it as `LockOptions.Session`; `LockOptions.SessionOpts` makes the Lock API create a second, default session (no TTL, no service check, `Behavior: release`) and ignores the ID
+- The Lock API only renews sessions it creates itself, so vip-elector renews the TTL every TTL/2
+- A renew answer of "session not found" means leadership is lost; other renew errors are retried
+
+### Graceful Shutdown
 - SIGINT/SIGTERM trigger context cancellation
-- Lock is explicitly released via `lock.Unlock()`
-- Session is destroyed to prevent stale sessions
-- This ensures clean leadership transfer during planned restarts
+- Renewal stops and the session is destroyed; `Behavior: "delete"` removes the key and lock-delay applies
+- The lock is deliberately not released with `lock.Unlock()`: that leaves the old hostname in the key and lets a standby take over before vip-manager on this node has removed the VIP
 
 ## Consul Integration Specifics
 
@@ -131,7 +137,6 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 ## Testing Considerations
 
-This codebase currently has no automated tests. When adding tests, consider:
-- Mock Consul API client for unit tests of election logic
-- Integration tests require a real Consul agent (use `consul agent -dev`)
-- Test scenarios: session creation failure, lock acquisition failure, lock loss detection, graceful shutdown
+- Unit tests: `make test` (`main_test.go`, `lock_behavior_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
+- E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
+- E2E scenarios include: lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key

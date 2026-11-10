@@ -201,7 +201,7 @@ func waitForNoLeader(t *testing.T, client *api.Client, timeout time.Duration) {
 			if err != nil {
 				t.Logf("Error getting key on timeout: %v", err)
 			} else {
-				t.Logf("Final key state: pair=%+v, Session=%s", pair, pair.Session)
+				t.Logf("Final key state: pair=%+v", pair)
 			}
 			t.Fatal("Timeout waiting for leader to step down")
 		case <-ticker.C:
@@ -212,8 +212,12 @@ func waitForNoLeader(t *testing.T, client *api.Client, timeout time.Duration) {
 			}
 
 			// Key deleted or session released (no longer holding lock)
-			if pair == nil || pair.Session == "" {
-				t.Logf("Leader stepped down: key=%v, session=%s", pair != nil, pair.Session)
+			if pair == nil {
+				t.Log("Leader stepped down: key deleted")
+				return
+			}
+			if pair.Session == "" {
+				t.Log("Leader stepped down: key exists without session")
 				return
 			}
 		}

@@ -51,11 +51,14 @@ func TestBuildLockOptions(t *testing.T) {
 	if string(opts.Value) != "node-a" {
 		t.Errorf("expected value=node-a, got %s", string(opts.Value))
 	}
-	if opts.SessionOpts == nil {
-		t.Fatal("expected SessionOpts to be set")
+	// The lock must reuse the session we created. If Session is empty the
+	// Lock API creates its own default session (no TTL, no service check,
+	// Behavior=release) and SessionOpts.ID is ignored.
+	if opts.Session != "session-123" {
+		t.Errorf("expected Session=session-123, got %q", opts.Session)
 	}
-	if opts.SessionOpts.ID != "session-123" {
-		t.Errorf("expected session ID=session-123, got %s", opts.SessionOpts.ID)
+	if opts.SessionOpts != nil {
+		t.Errorf("expected SessionOpts to be nil, got %+v", opts.SessionOpts)
 	}
 
 	if opts.MonitorRetries != defaultMonitorRetries {
