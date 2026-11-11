@@ -13,6 +13,10 @@ vip-elector is a leader election daemon that works in conjunction with [vip-mana
 - `dcs-endpoints` (Consul address list)
 - `trigger-key` (KV path for leader hostname)
 
+Optional field also read: `trigger-value` (the lock value). It must be a YAML string (`yamlString`): vip-manager reads the file through viper, which converts numbers and booleans (`01` → `1`), so unquoted ones are rejected.
+
+`consul-token` is deliberately not read: vip-manager needs only key read access while vip-elector needs session and key write access, so falling back to vip-manager's token could break a setup that works with the agent's default token.
+
 ## Architecture
 
 ### Core Flow (main.go)
@@ -76,10 +80,10 @@ consul agent -dev  # In another terminal
 
 ## Important Implementation Details
 
-### Hostname Handling (lines 191-203)
-- Defaults to "short hostname" (strips domain after first dot)
-- Override with `--hostname` flag if FQDN is needed
-- The hostname becomes the KV lock value that vip-manager matches against
+### Lock Value (`resolveLockValue`)
+- The value written to the trigger key must equal vip-manager's `trigger-value`, otherwise vip-manager never assigns the VIP (no error on either side)
+- Precedence: `--hostname` flag > `trigger-value` from vip-manager.yml > `os.Hostname()` unmodified (vip-manager's own default; do not shorten it)
+- `warnIfFlagDiffersFromVipManager` warns when `--hostname` differs from vip-manager's default value on this node
 
 ### Health Check Verification (lines 205-216)
 - If `--check-id` is provided, the program verifies it exists in Consul at startup
@@ -141,6 +145,6 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 ## Testing Considerations
 
-- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
+- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `lock_value_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
 - E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
-- E2E scenarios include: lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session
+- E2E scenarios include: lock value from `trigger-value` / OS hostname / `--hostname`, lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session

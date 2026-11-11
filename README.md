@@ -19,8 +19,8 @@ A leader election daemon using Consul Session and KV Lock, designed to work with
 ## How It Works
 
 1. **vip-elector** creates a Consul Session linked to a local HTTP health check
-2. **vip-elector** acquires a KV lock on the trigger-key, writing its hostname as the value
-3. **[vip-manager](https://github.com/cybertec-postgresql/vip-manager)** monitors the same key and assigns the VIP to the node whose hostname matches
+2. **vip-elector** acquires a KV lock on the trigger-key, writing its hostname (vip-manager's `trigger-value`) as the value
+3. **[vip-manager](https://github.com/cybertec-postgresql/vip-manager)** monitors the same key and assigns the VIP to the node whose `trigger-value` matches
 4. If the HTTP check fails → Session invalidates → trigger-key is deleted → Another node acquires lock after the lock delay
 5. VIP automatically moves to the new leader (via vip-manager)
 
@@ -111,7 +111,9 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
                       dcs-endpoints; passed to the Consul client as is, like
                       CONSUL_HTTP_ADDR)
 --token               Consul ACL token (overrides CONSUL_HTTP_TOKEN)
---hostname            Hostname to write to lock value (defaults to short hostname)
+--hostname            Value to write to the trigger-key. Must equal vip-manager's
+                      trigger-value on this node (default: trigger-value from
+                      vip-manager.yml, otherwise the OS hostname as is)
 ```
 
 ### Environment Variables
@@ -383,13 +385,23 @@ This is not a fencing guarantee. The old leader's vip-manager still needs up to 
 
 The lock is held by the session vip-elector creates (`Behavior: delete`, `--ttl`, `--lock-delay`, `serfHealth` and `--check-id`). vip-elector renews it every TTL/2. If Consul reports the session no longer exists, vip-elector treats that as loss of leadership and re-enters the election. Renew errors are retried for as long as Consul does not answer: vip-elector does not give up leadership on its own while Consul is unreachable, and learns whether the session expired once Consul answers again.
 
-### Short hostname vs FQDN
+### Lock value (trigger-value)
 
-By default, vip-elector uses the short hostname (before first dot). Override with `--hostname` if needed:
+vip-manager assigns the VIP when the value of the trigger-key equals its `trigger-value`, which defaults to the OS hostname. vip-elector resolves the value it writes the same way, so both agree without extra configuration:
 
-```bash
---hostname=$(hostname -f)  # Use FQDN
-```
+1. `--hostname` flag
+2. `trigger-value` from vip-manager.yml
+3. The OS hostname, unmodified (`os.Hostname()`, the same call vip-manager makes)
+
+If vip-manager gets its `trigger-value` from somewhere else (its `--trigger-value` flag or the `VIP_TRIGGER_VALUE` environment variable), pass the same value to vip-elector with `--hostname`. vip-elector logs the value it uses at startup (`Using hostname`, with its `source`), and warns when `--hostname` differs from what vip-manager uses by default (`trigger-value` from vip-manager.yml, otherwise the OS hostname).
+
+Quote a `trigger-value` that YAML would read as a number, boolean or date (`"01"`, not `01`). vip-manager converts such values (`01` becomes `1`), so vip-elector refuses to start with an unquoted one rather than write a value vip-manager never matches.
+
+> **Upgrade note**: versions up to 0.1.5 wrote the short hostname (up to the first dot) and ignored `trigger-value`. This only changes anything on a host whose hostname is an FQDN and that does not pass `--hostname`:
+>
+> - There, the old value never matched vip-manager's default, so the VIP was not assigned. It now is.
+> - If you worked around that by setting vip-manager's `trigger-value` to the short name in vip-manager.yml, the value stays the same. If you set it with vip-manager's flag or environment variable instead, pass it to vip-elector with `--hostname`.
+> - The session name (`vip-elector-<value>`) and the value in the trigger-key now carry the FQDN; adjust any tooling that matches them.
 
 ### Lock Delay
 
