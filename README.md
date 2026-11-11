@@ -95,7 +95,7 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
 
    See the [vip-manager documentation](https://github.com/cybertec-postgresql/vip-manager#configuration) for full configuration options.
 
-   vip-elector connects to the **first** entry of `dcs-endpoints` only, as vip-manager's Consul checker does. The scheme is honored: an `https://` endpoint is connected to over TLS (see [TLS Configuration](#tls-configuration)).
+   vip-elector reads `dcs-endpoints` the way vip-manager's Consul checker does: only the **first** entry is used, and only its scheme, host and port (any path is ignored). An `https://` endpoint is connected to over TLS (see [TLS Configuration](#tls-configuration)). Note that `CONSUL_HTTP_SSL=true` makes vip-elector use HTTPS even for an `http://` endpoint, while vip-manager does not read that variable.
 
 ### Command-line Options
 
@@ -107,15 +107,17 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
                       Consul expires the session after up to twice the TTL
 --lock-delay          Time other nodes must wait after the leader's session ends
                       before they can acquire the lock (default: 2s, 0s = no delay)
---addr                Consul address, e.g. https://127.0.0.1:8501
-                      (overrides dcs-endpoints and CONSUL_HTTP_ADDR)
+--addr                Consul address, e.g. https://127.0.0.1:8501 (overrides
+                      dcs-endpoints; passed to the Consul client as is, like
+                      CONSUL_HTTP_ADDR)
 --token               Consul ACL token (overrides CONSUL_HTTP_TOKEN)
 --hostname            Hostname to write to lock value (defaults to short hostname)
 ```
 
 ### Environment Variables
 
-- `CONSUL_HTTP_ADDR`: Consul address
+- `CONSUL_HTTP_ADDR`: not used: the address comes from `dcs-endpoints` (required) or `--addr`
+- `CONSUL_HTTP_SSL`: `true` forces HTTPS
 - `CONSUL_HTTP_TOKEN`: ACL token
 - `CONSUL_CACERT`, `CONSUL_CLIENT_CERT`, `CONSUL_CLIENT_KEY`: TLS certificates
 

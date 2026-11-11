@@ -72,11 +72,53 @@ func TestBuildConsulConfig(t *testing.T) {
 			wantAddr:   "consul-tls.example.com:8501",
 		},
 		{
+			// api.NewClient never downgrades to HTTP when TLS is requested
+			// through the environment.
+			name:       "http endpoint with CONSUL_HTTP_SSL stays https",
+			config:     &Config{},
+			endpoints:  []string{"http://consul.example.com:8500"},
+			env:        map[string]string{api.HTTPSSLEnvName: "true"},
+			wantScheme: "https",
+			wantAddr:   "consul.example.com:8500",
+		},
+		{
 			name:       "trailing slash is ignored",
 			config:     &Config{},
 			endpoints:  []string{"https://consul-tls.example.com:8501/"},
 			wantScheme: "https",
 			wantAddr:   "consul-tls.example.com:8501",
+		},
+		{
+			// vip-manager ignores the path; a path prefix would break every
+			// request.
+			name:       "path is ignored",
+			config:     &Config{},
+			endpoints:  []string{"http://consul.example.com:8500/ui"},
+			wantScheme: "http",
+			wantAddr:   "consul.example.com:8500",
+		},
+		{
+			// vip-manager accepts it (url.Parse lowercases the scheme);
+			// api.NewClient rejects an upper-case scheme.
+			name:       "upper-case scheme",
+			config:     &Config{},
+			endpoints:  []string{"HTTPS://consul-tls.example.com:8501"},
+			wantScheme: "https",
+			wantAddr:   "consul-tls.example.com:8501",
+		},
+		{
+			name:       "IPv6 endpoint",
+			config:     &Config{},
+			endpoints:  []string{"https://[::1]:8501"},
+			wantScheme: "https",
+			wantAddr:   "[::1]:8501",
+		},
+		{
+			name:       "unix socket endpoint",
+			config:     &Config{},
+			endpoints:  []string{"unix:///var/run/consul.sock"},
+			wantScheme: "http",
+			wantAddr:   "/var/run/consul.sock",
 		},
 		{
 			name:       "only the first endpoint is used",
@@ -92,13 +134,6 @@ func TestBuildConsulConfig(t *testing.T) {
 			env:        map[string]string{api.HTTPAddrEnvName: "env.example.com:8500"},
 			wantScheme: "http",
 			wantAddr:   "consul.example.com:8500",
-		},
-		{
-			name:       "CONSUL_HTTP_ADDR used without endpoints",
-			config:     &Config{},
-			env:        map[string]string{api.HTTPAddrEnvName: "https://env.example.com:8501"},
-			wantScheme: "https",
-			wantAddr:   "env.example.com:8501",
 		},
 		{
 			name:       "--addr overrides endpoint",

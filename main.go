@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -233,25 +234,29 @@ func loadVipManagerConfig(path string) (*VipManagerConfig, error) {
 }
 
 func createConsulClient(config *Config, vipMgrConfig *VipManagerConfig) (*api.Client, error) {
-	return api.NewClient(buildConsulConfig(config, vipMgrConfig))
+	consulConfig := buildConsulConfig(config, vipMgrConfig)
+	client, err := api.NewClient(consulConfig)
+	if err != nil {
+		return nil, err
+	}
+	// api.NewClient resolves the scheme from the address; log the result.
+	slog.Info("Consul client", "address", consulConfig.Address, "scheme", consulConfig.Scheme)
+	return client, nil
 }
 
 // buildConsulConfig returns the Consul client configuration.
 //
-// Address priority: CLI flag > first dcs-endpoints entry > CONSUL_HTTP_ADDR.
-// Only the first endpoint is used, as vip-manager's Consul checker does.
+// The address comes from --addr if set, otherwise from the first
+// dcs-endpoints entry (only the first one is used, as in vip-manager's Consul
+// checker). dcs-endpoints is required, so CONSUL_HTTP_ADDR never applies.
 func buildConsulConfig(config *Config, vipMgrConfig *VipManagerConfig) *api.Config {
 	consulConfig := api.DefaultConfig()
 
 	if config.ConsulAddr != "" {
+		// Passed as is, like CONSUL_HTTP_ADDR to the Consul CLI.
 		consulConfig.Address = config.ConsulAddr
 	} else if len(vipMgrConfig.DCSEndpoints) > 0 {
-		// Keep the scheme: api.NewClient switches to HTTPS for an
-		// "https://" address, like vip-manager does for the same endpoint.
-		// Stripping it would connect to a TLS endpoint over plain HTTP.
-		// A trailing slash would become a "/" path prefix and break every
-		// request, while vip-manager ignores it.
-		consulConfig.Address = strings.TrimRight(vipMgrConfig.DCSEndpoints[0], "/")
+		consulConfig.Address = normalizeEndpoint(vipMgrConfig.DCSEndpoints[0])
 	}
 
 	if config.ConsulToken != "" {
@@ -259,6 +264,30 @@ func buildConsulConfig(config *Config, vipMgrConfig *VipManagerConfig) *api.Conf
 	}
 
 	return consulConfig
+}
+
+// normalizeEndpoint returns a dcs-endpoints entry the way vip-manager reads
+// it: vip-manager parses it with url.Parse (which lowercases the scheme) and
+// connects to its scheme, host and port, ignoring any path.
+//
+// The scheme must be kept: api.NewClient switches to HTTPS for an "https://"
+// address. Stripping it would connect to a TLS endpoint over plain HTTP. A
+// path must be dropped: api.NewClient would use it as a path prefix (even a
+// lone trailing "/"), and every request would miss.
+//
+// Entries without an http(s) scheme ("host:port", "unix://...") are returned
+// unchanged for api.NewClient to handle.
+func normalizeEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return endpoint
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return u.Scheme + "://" + u.Host
+	default:
+		return endpoint
+	}
 }
 
 func getShortHostname() (string, error) {
