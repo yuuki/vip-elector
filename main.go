@@ -34,6 +34,11 @@ const (
 	// Retry lock monitoring briefly on Consul 500/transient unavailability.
 	defaultMonitorRetries   = 3
 	defaultMonitorRetryTime = 10 * time.Second
+	// How long each blocking query of a pending lock attempt waits. The Lock
+	// API checks its stop channel only between queries, so this bounds how
+	// long a standby takes to react to shutdown or to losing its session.
+	// The Lock API default is 15s.
+	defaultLockWaitTime = 2 * time.Second
 	// How long to wait before retrying a failed session renewal.
 	sessionRenewRetryInterval = time.Second
 	// LockFlagValue is the magic flag Consul uses to identify lock keys
@@ -648,6 +653,9 @@ func buildLockOptions(triggerKey, hostname, sessionID string) *api.LockOptions {
 		// immediately trigger lock-loss handling.
 		MonitorRetries:   defaultMonitorRetries,
 		MonitorRetryTime: defaultMonitorRetryTime,
+		// Without LockTryOnce this only shortens each blocking query; the
+		// attempt itself still waits for the lock indefinitely.
+		LockWaitTime: defaultLockWaitTime,
 	}
 }
 

@@ -108,6 +108,7 @@ Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 
 ### Graceful Shutdown
 - SIGINT/SIGTERM trigger context cancellation
+- A standby blocked in `lock.Lock()` only sees its stop channel between blocking queries, so `LockOptions.LockWaitTime` is set to 2s (Lock API default: 15s). This bounds both shutdown of a standby and its reaction to a lost session. A hung Consul still blocks the query (the Lock API takes no context). Trade-off: a standby issues a query every 2s, so during a Consul leader election it is more likely to get a 500, give up the attempt and retry with backoff (the leader is unaffected: `monitorLock` sends no `wait`). Do not go much lower
 - Renewal stops and the session is destroyed; `Behavior: "delete"` removes the key and lock-delay applies
 - The lock is deliberately not released with `lock.Unlock()`: that leaves the old hostname in the key and lets a standby take over before vip-manager on this node has removed the VIP
 
@@ -151,4 +152,4 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 - Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `lock_value_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
 - E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
-- E2E scenarios include: lock value from `trigger-value` / OS hostname / `--hostname`, lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session
+- E2E scenarios include: standby exiting promptly on SIGTERM, lock value from `trigger-value` / OS hostname / `--hostname`, lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session
