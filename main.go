@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -233,22 +234,60 @@ func loadVipManagerConfig(path string) (*VipManagerConfig, error) {
 }
 
 func createConsulClient(config *Config, vipMgrConfig *VipManagerConfig) (*api.Client, error) {
+	consulConfig := buildConsulConfig(config, vipMgrConfig)
+	client, err := api.NewClient(consulConfig)
+	if err != nil {
+		return nil, err
+	}
+	// api.NewClient resolves the scheme from the address; log the result.
+	slog.Info("Consul client", "address", consulConfig.Address, "scheme", consulConfig.Scheme)
+	return client, nil
+}
+
+// buildConsulConfig returns the Consul client configuration.
+//
+// The address comes from --addr if set, otherwise from the first
+// dcs-endpoints entry (only the first one is used, as in vip-manager's Consul
+// checker). dcs-endpoints is required, so CONSUL_HTTP_ADDR never applies.
+func buildConsulConfig(config *Config, vipMgrConfig *VipManagerConfig) *api.Config {
 	consulConfig := api.DefaultConfig()
 
-	// Priority: CLI flag > vip-manager.yml > environment variable
 	if config.ConsulAddr != "" {
+		// Passed as is, like CONSUL_HTTP_ADDR to the Consul CLI.
 		consulConfig.Address = config.ConsulAddr
 	} else if len(vipMgrConfig.DCSEndpoints) > 0 {
-		// Use first endpoint from vip-manager.yml
-		consulConfig.Address = strings.TrimPrefix(vipMgrConfig.DCSEndpoints[0], "http://")
-		consulConfig.Address = strings.TrimPrefix(consulConfig.Address, "https://")
+		consulConfig.Address = normalizeEndpoint(vipMgrConfig.DCSEndpoints[0])
 	}
 
 	if config.ConsulToken != "" {
 		consulConfig.Token = config.ConsulToken
 	}
 
-	return api.NewClient(consulConfig)
+	return consulConfig
+}
+
+// normalizeEndpoint returns a dcs-endpoints entry the way vip-manager reads
+// it: vip-manager parses it with url.Parse (which lowercases the scheme) and
+// connects to its scheme, host and port, ignoring any path.
+//
+// The scheme must be kept: api.NewClient switches to HTTPS for an "https://"
+// address. Stripping it would connect to a TLS endpoint over plain HTTP. A
+// path must be dropped: api.NewClient would use it as a path prefix (even a
+// lone trailing "/"), and every request would miss.
+//
+// Entries without an http(s) scheme ("host:port", "unix://...") are returned
+// unchanged for api.NewClient to handle.
+func normalizeEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return endpoint
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return u.Scheme + "://" + u.Host
+	default:
+		return endpoint
+	}
 }
 
 func getShortHostname() (string, error) {

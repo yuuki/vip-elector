@@ -87,7 +87,10 @@ consul agent -dev  # In another terminal
 - Without a valid check ID, health-based failover won't work (session won't invalidate on health failures)
 
 ### Configuration Precedence (createConsulClient)
-Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml > `CONSUL_HTTP_ADDR` env
+Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml (`dcs-endpoints` is required, so `CONSUL_HTTP_ADDR` never applies)
+- `normalizeEndpoint` reads the endpoint like vip-manager (`url.Parse`, lowercase scheme, scheme + host only, path dropped) and keeps the scheme: `api.NewClient` switches to HTTPS for `https://`; stripping the scheme would talk plain HTTP to a TLS endpoint
+- Only the first `dcs-endpoints` entry is used, as in vip-manager's Consul checker
+- `--addr` is passed to the Consul client unmodified
 Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 
 ### Session Ownership and Renewal
@@ -111,7 +114,7 @@ agent_prefix "" { policy = "read" }  # Check verification
 ```
 
 ### Environment Variables Supported
-- `CONSUL_HTTP_ADDR`: Consul address
+- `CONSUL_HTTP_ADDR`: not used for the address (`dcs-endpoints` is required and wins)
 - `CONSUL_HTTP_TOKEN`: ACL token
 - `CONSUL_CACERT`, `CONSUL_CLIENT_CERT`, `CONSUL_CLIENT_KEY`: TLS configuration
 
@@ -138,6 +141,6 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 ## Testing Considerations
 
-- Unit tests: `make test` (`main_test.go`, `lock_behavior_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
+- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
 - E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
 - E2E scenarios include: lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session
