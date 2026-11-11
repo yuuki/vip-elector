@@ -341,10 +341,10 @@ func TestStandbySessionLossReentersElection(t *testing.T) {
 		t.Fatalf("Failed to update check: %v", err)
 	}
 
-	// The standby notices within TTL/2, but the pending lock attempt only
-	// returns when its blocking query does (up to 15s).
+	// The standby notices within TTL/2, and the pending lock attempt returns
+	// when its current blocking query does (vip-elector bounds it to 2s).
 	var second string
-	deadline = time.Now().Add(40 * time.Second)
+	deadline = time.Now().Add(20 * time.Second)
 	for second == "" {
 		if time.Now().After(deadline) {
 			t.Fatal("Standby node2 did not create a new session after losing the first one")
@@ -420,5 +420,71 @@ func TestRejectsZeroTTL(t *testing.T) {
 	}
 	if !strings.Contains(string(output), "invalid --ttl") {
 		t.Errorf("Expected 'invalid --ttl' in output, got: %s", output)
+	}
+}
+
+// TestStandbyShutdownIsPrompt verifies that a standby waiting for the lock
+// exits promptly on SIGTERM. The Lock API only checks for shutdown between
+// blocking queries, which wait 15s by default.
+func TestStandbyShutdownIsPrompt(t *testing.T) {
+	client := setupConsulClient(t)
+
+	_, cleanup1 := startElector(t, "node1", "")
+	defer cleanup1()
+
+	waitForLeaderValue(t, client, "node1", 10*time.Second)
+
+	// Started directly rather than with startElector, so that only one
+	// goroutine waits for the process.
+	configPath, err := filepath.Abs(testConfigPath)
+	if err != nil {
+		t.Fatalf("Failed to get absolute config path: %v", err)
+	}
+	cmd2 := exec.Command("./"+binaryName,
+		"--vip-manager-config="+configPath,
+		"--hostname=node2",
+		"--ttl=10s",
+		"--lock-delay=100ms",
+	)
+	cmd2.Stdout = os.Stdout
+	cmd2.Stderr = os.Stderr
+	if err := cmd2.Start(); err != nil {
+		t.Fatalf("Failed to start elector: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		cmd2.Wait()
+		close(exited)
+	}()
+	defer func() {
+		cmd2.Process.Signal(os.Interrupt)
+		<-exited
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for liveSessionNamed(t, client, "vip-elector-node2") == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("Standby node2 never created a session")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Let the standby enter a blocking query on the held key.
+	time.Sleep(time.Second)
+
+	start := time.Now()
+	if err := cmd2.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("Failed to send SIGTERM: %v", err)
+	}
+
+	select {
+	case <-exited:
+		t.Logf("Standby exited after %v", time.Since(start))
+	case <-time.After(6 * time.Second):
+		t.Fatalf("Standby did not exit within 6s of SIGTERM")
+	}
+
+	// The standby's session is destroyed on the way out.
+	if id := liveSessionNamed(t, client, "vip-elector-node2"); id != "" {
+		t.Errorf("Standby session %s still exists after shutdown", id)
 	}
 }

@@ -240,6 +240,8 @@ vip-elector destroys its session → trigger-key deleted → Failover to standby
 
 If the process is killed without a chance to clean up (`SIGKILL`, crash), the session is no longer renewed and Consul expires it after up to twice the TTL, then failover proceeds as above. With the default `--ttl=10s` expect roughly 25 seconds in total.
 
+Stopping a standby takes about 2 seconds at most: a standby waits for the lock in blocking queries of 2 seconds and notices the shutdown between them. If Consul hangs instead of answering, the stop waits for it.
+
 ### 3. Node Failure
 
 Network partition or node crash → Consul agent disconnects → Session invalidates → Automatic failover
