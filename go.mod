@@ -1,6 +1,6 @@
 module github.com/yuuki/vip-elector
 
-go 1.25.1
+go 1.27.4
 
 require (
 	github.com/hashicorp/consul/api v1.32.4
