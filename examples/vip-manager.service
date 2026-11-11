@@ -14,6 +14,13 @@ Group=root
 ExecStart=/usr/local/bin/vip-manager \
   --config=/etc/vip-manager.yml
 
+# vip-manager only handles SIGINT. With systemd's default SIGTERM it exits
+# without removing the VIP from the interface.
+KillSignal=SIGINT
+# vip-manager 4.0.0 removes the VIP on SIGINT but then does not exit while the
+# trigger key is absent (no leader). Do not wait the default 90s for that.
+TimeoutStopSec=5
+
 Restart=always
 RestartSec=2
 StartLimitInterval=0
@@ -23,8 +30,10 @@ StandardError=journal
 SyslogIdentifier=vip-manager
 
 # Capabilities needed for VIP management
-# AmbientCapabilities=CAP_NET_ADMIN
-# CapabilityBoundingSet=CAP_NET_ADMIN
+# CAP_NET_ADMIN: add/remove the VIP. CAP_NET_RAW: send gratuitous ARP.
+# Without CAP_NET_RAW the VIP is assigned but neighbours are never notified.
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target

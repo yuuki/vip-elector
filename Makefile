@@ -14,7 +14,7 @@ test: ## Run unit tests
 test-e2e: consul-up ## Run E2E tests (requires Consul via docker-compose)
 	@echo "Waiting for Consul to be ready..."
 	@sleep 3
-	go test -v -race -tags=e2e ./e2e/... -timeout=3m
+	go test -v -race -tags=e2e ./e2e/... -timeout=5m
 	@$(MAKE) consul-down
 
 .PHONY: test-all

@@ -29,7 +29,7 @@ ExecStart=/usr/local/bin/vip-elector \
   --vip-manager-config=/etc/vip-manager.yml \
   --check-id=vip-http \
   --ttl=10s \
-  --lock-delay=1s
+  --lock-delay=2s
 
 # Restart policy
 Restart=always

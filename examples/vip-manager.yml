@@ -25,5 +25,7 @@ interval: 1000
 # Optional: Retry interval on DCS connection failure (milliseconds)
 # retry-after: 250
 
-# Optional: Number of retries before giving up (-1 = infinite)
-# retry-num: -1
+# Optional: Number of retries for interactions with outside components (default: 3)
+# Keep this at 1 or more. There is no "infinite" value: with vip-manager 2.x,
+# 0 or a negative number makes it skip the gratuitous ARP after assigning the VIP.
+# retry-num: 3
