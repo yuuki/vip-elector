@@ -4,9 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-
-	"github.com/hashicorp/consul/api"
 )
 
 func TestResolveLockValue(t *testing.T) {
@@ -101,26 +100,27 @@ func TestResolveLockValue_DefaultMatchesOSHostname(t *testing.T) {
 	}
 }
 
-func TestLoadVipManagerConfig_TriggerValueAndToken(t *testing.T) {
+func TestLoadVipManagerConfig_TriggerValue(t *testing.T) {
 	tests := []struct {
 		name             string
 		extra            string
 		wantTriggerValue string
-		wantToken        string
+		wantErr          bool
 	}{
 		{name: "not set"},
-		{
-			name:             "set",
-			extra:            "trigger-value: \"node-a\"\nconsul-token: \"secret\"\n",
-			wantTriggerValue: "node-a",
-			wantToken:        "secret",
-		},
-		{
-			// vip-manager reads it as a string too.
-			name:             "numeric trigger-value",
-			extra:            "trigger-value: 200\n",
-			wantTriggerValue: "200",
-		},
+		{name: "empty", extra: "trigger-value:\n"},
+		{name: "null", extra: "trigger-value: ~\n"},
+		{name: "empty string", extra: "trigger-value: \"\"\n"},
+		{name: "plain string", extra: "trigger-value: node-a\n", wantTriggerValue: "node-a"},
+		{name: "quoted string", extra: "trigger-value: \"node-a.example.com\"\n", wantTriggerValue: "node-a.example.com"},
+		{name: "quoted number", extra: "trigger-value: \"01\"\n", wantTriggerValue: "01"},
+		// vip-manager (viper) would read these as 1, 31, 1 and 1000: refuse
+		// rather than write a value it never matches.
+		{name: "zero-padded number", extra: "trigger-value: 01\n", wantErr: true},
+		{name: "hex number", extra: "trigger-value: 0x1F\n", wantErr: true},
+		{name: "boolean", extra: "trigger-value: true\n", wantErr: true},
+		{name: "float", extra: "trigger-value: 1e3\n", wantErr: true},
+		{name: "list", extra: "trigger-value: [a]\n", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -132,90 +132,58 @@ func TestLoadVipManagerConfig_TriggerValueAndToken(t *testing.T) {
 			}
 
 			cfg, err := loadVipManagerConfig(path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got trigger-value %q", cfg.TriggerValue)
+				}
+				if !strings.Contains(err.Error(), "quote it") && !strings.Contains(err.Error(), "expected a string") {
+					t.Errorf("error does not explain the fix: %v", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if cfg.TriggerValue != tt.wantTriggerValue {
+			if string(cfg.TriggerValue) != tt.wantTriggerValue {
 				t.Errorf("TriggerValue = %q, want %q", cfg.TriggerValue, tt.wantTriggerValue)
-			}
-			if cfg.ConsulToken != tt.wantToken {
-				t.Errorf("ConsulToken = %q, want %q", cfg.ConsulToken, tt.wantToken)
 			}
 		})
 	}
 }
 
-func TestBuildConsulConfig_TokenFallback(t *testing.T) {
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte("file-token\n"), 0o600); err != nil {
-		t.Fatalf("write token file: %v", err)
-	}
+func TestWarnIfFlagDiffersFromVipManager(t *testing.T) {
+	osHostname := func() (string, error) { return "node-a", nil }
 
 	tests := []struct {
-		name      string
-		flagToken string // Config.ConsulToken: --token, or CONSUL_HTTP_TOKEN via parseFlags
-		env       map[string]string
-		ymlToken  string
-		wantToken string
+		name         string
+		flagValue    string
+		triggerValue string
+		wantWarn     bool
 	}{
+		{name: "matches trigger-value", flagValue: "tv-node", triggerValue: "tv-node"},
+		{name: "differs from trigger-value", flagValue: "flag-node", triggerValue: "tv-node", wantWarn: true},
+		{name: "matches OS hostname", flagValue: "node-a"},
 		{
-			name:      "consul-token from vip-manager.yml as last resort",
-			ymlToken:  "yml-token",
-			wantToken: "yml-token",
-		},
-		{
-			name:      "--token wins over consul-token",
-			flagToken: "cli-token",
-			ymlToken:  "yml-token",
-			wantToken: "cli-token",
-		},
-		{
-			name:      "CONSUL_HTTP_TOKEN wins over consul-token",
-			env:       map[string]string{api.HTTPTokenEnvName: "env-token"},
-			ymlToken:  "yml-token",
-			wantToken: "env-token",
-		},
-		{
-			name:      "CONSUL_HTTP_TOKEN_FILE wins over consul-token",
-			env:       map[string]string{api.HTTPTokenFileEnvName: tokenFile},
-			ymlToken:  "yml-token",
-			wantToken: "file-token",
-		},
-		{
-			// Consul's own precedence, applied by api.NewClient.
-			name: "CONSUL_HTTP_TOKEN_FILE wins over CONSUL_HTTP_TOKEN",
-			env: map[string]string{
-				api.HTTPTokenEnvName:     "env-token",
-				api.HTTPTokenFileEnvName: tokenFile,
-			},
-			flagToken: "env-token", // parseFlags copies CONSUL_HTTP_TOKEN
-			ymlToken:  "yml-token",
-			wantToken: "file-token",
-		},
-		{
-			name:      "no token anywhere",
-			wantToken: "",
+			// e.g. --hostname=$(hostname -f) on a host whose hostname is short:
+			// vip-manager compares against "node-a" by default.
+			name:      "differs from OS hostname",
+			flagValue: "node-a.example.com",
+			wantWarn:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clearConsulEnv(t)
-			for k, v := range tt.env {
-				t.Setenv(k, v)
-			}
-
-			cfg := buildConsulConfig(&Config{ConsulToken: tt.flagToken}, &VipManagerConfig{
-				DCSEndpoints: []string{"http://127.0.0.1:8500"},
-				ConsulToken:  tt.ymlToken,
-			})
-			// api.NewClient applies CONSUL_HTTP_TOKEN_FILE.
-			if _, err := api.NewClient(cfg); err != nil {
-				t.Fatalf("api.NewClient: %v", err)
-			}
-			if cfg.Token != tt.wantToken {
-				t.Errorf("Token = %q, want %q", cfg.Token, tt.wantToken)
+			if got := warnIfFlagDiffersFromVipManager(tt.flagValue, tt.triggerValue, osHostname); got != tt.wantWarn {
+				t.Errorf("warned = %v, want %v", got, tt.wantWarn)
 			}
 		})
 	}
+
+	t.Run("OS hostname unavailable", func(t *testing.T) {
+		failing := func() (string, error) { return "", errors.New("boom") }
+		if warnIfFlagDiffersFromVipManager("flag-node", "", failing) {
+			t.Error("expected no warning when the OS hostname is unknown")
+		}
+	})
 }

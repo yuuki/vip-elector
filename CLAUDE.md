@@ -13,7 +13,9 @@ vip-elector is a leader election daemon that works in conjunction with [vip-mana
 - `dcs-endpoints` (Consul address list)
 - `trigger-key` (KV path for leader hostname)
 
-Optional fields also read: `trigger-value` (the lock value) and `consul-token` (token fallback).
+Optional field also read: `trigger-value` (the lock value). It must be a YAML string (`yamlString`): vip-manager reads the file through viper, which converts numbers and booleans (`01` → `1`), so unquoted ones are rejected.
+
+`consul-token` is deliberately not read: vip-manager needs only key read access while vip-elector needs session and key write access, so falling back to vip-manager's token could break a setup that works with the agent's default token.
 
 ## Architecture
 
@@ -81,6 +83,7 @@ consul agent -dev  # In another terminal
 ### Lock Value (`resolveLockValue`)
 - The value written to the trigger key must equal vip-manager's `trigger-value`, otherwise vip-manager never assigns the VIP (no error on either side)
 - Precedence: `--hostname` flag > `trigger-value` from vip-manager.yml > `os.Hostname()` unmodified (vip-manager's own default; do not shorten it)
+- `warnIfFlagDiffersFromVipManager` warns when `--hostname` differs from vip-manager's default value on this node
 
 ### Health Check Verification (lines 205-216)
 - If `--check-id` is provided, the program verifies it exists in Consul at startup
@@ -92,7 +95,7 @@ Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml 
 - `normalizeEndpoint` reads the endpoint like vip-manager (`url.Parse`, lowercase scheme, scheme + host only, path dropped) and keeps the scheme: `api.NewClient` switches to HTTPS for `https://`; stripping the scheme would talk plain HTTP to a TLS endpoint
 - Only the first `dcs-endpoints` entry is used, as in vip-manager's Consul checker
 - `--addr` is passed to the Consul client unmodified
-Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN_FILE` env > `CONSUL_HTTP_TOKEN` env (order between the two applied by `api.NewClient`) > `consul-token` from vip-manager.yml. vip-manager's token is last so that a separate vip-elector token (it needs write access) is not overridden by it
+Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 
 ### Session Ownership and Renewal
 - The lock must be held by the session `createSession` returns. Pass it as `LockOptions.Session`; `LockOptions.SessionOpts` makes the Lock API create a second, default session (no TTL, no service check, `Behavior: release`) and ignores the ID
@@ -142,6 +145,6 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 ## Testing Considerations
 
-- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
+- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `lock_value_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
 - E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
-- E2E scenarios include: lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session
+- E2E scenarios include: lock value from `trigger-value` / OS hostname / `--hostname`, lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session

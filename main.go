@@ -47,9 +47,29 @@ type VipManagerConfig struct {
 	TriggerKey   string   `yaml:"trigger-key"`
 	// TriggerValue is the value vip-manager compares the trigger key with.
 	// vip-manager defaults it to os.Hostname() when it is not set.
-	TriggerValue string `yaml:"trigger-value"`
-	// ConsulToken is the ACL token vip-manager uses for Consul.
-	ConsulToken string `yaml:"consul-token"`
+	TriggerValue yamlString `yaml:"trigger-value"`
+}
+
+// yamlString is a YAML scalar that must be written as a string (or left
+// empty). vip-manager reads its config through viper, which converts other
+// scalars on its own terms: 01 becomes "1", 0x1F "31", true "1". Reading the
+// raw text instead would silently disagree with vip-manager, so such values
+// are rejected and have to be quoted.
+type yamlString string
+
+func (s *yamlString) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("line %d: expected a string", node.Line)
+	}
+	switch node.ShortTag() {
+	case "!!str":
+		*s = yamlString(node.Value)
+	case "!!null":
+		*s = ""
+	default:
+		return fmt.Errorf("line %d: %s is read as %s, not as a string, and vip-manager may convert it (for example 01 to 1); quote it", node.Line, node.Value, node.ShortTag())
+	}
+	return nil
 }
 
 // Config holds the runtime configuration
@@ -110,15 +130,15 @@ func run() error {
 
 	// The value written to the trigger key. It must equal vip-manager's
 	// trigger-value on this node, or vip-manager never assigns the VIP.
-	hostname, source, err := resolveLockValue(config.Hostname, vipMgrConfig.TriggerValue, os.Hostname)
+	triggerValue := string(vipMgrConfig.TriggerValue)
+	hostname, source, err := resolveLockValue(config.Hostname, triggerValue, os.Hostname)
 	if err != nil {
 		return fmt.Errorf("failed to get hostname: %w", err)
 	}
 
-	slog.Info("Using lock value", "value", hostname, "source", source)
-	if source == lockValueSourceFlag && vipMgrConfig.TriggerValue != "" && hostname != vipMgrConfig.TriggerValue {
-		slog.Warn("--hostname differs from trigger-value in vip-manager config: vip-manager will not assign the VIP to this node unless its trigger-value is overridden by a flag or environment variable",
-			"hostname", hostname, "trigger_value", vipMgrConfig.TriggerValue)
+	slog.Info("Using hostname", "hostname", hostname, "source", source)
+	if source == lockValueSourceFlag {
+		warnIfFlagDiffersFromVipManager(hostname, triggerValue, os.Hostname)
 	}
 
 	// Verify check exists (if specified)
@@ -265,16 +285,8 @@ func buildConsulConfig(config *Config, vipMgrConfig *VipManagerConfig) *api.Conf
 		consulConfig.Address = normalizeEndpoint(vipMgrConfig.DCSEndpoints[0])
 	}
 
-	// Token priority: --token > CONSUL_HTTP_TOKEN_FILE > CONSUL_HTTP_TOKEN
-	// (the order between the two variables is applied by api.NewClient) >
-	// consul-token from vip-manager.yml. vip-manager's token comes last so
-	// that a separate token for vip-elector (it needs session and key write
-	// access, vip-manager only key read) is not overridden by it.
 	if config.ConsulToken != "" {
 		consulConfig.Token = config.ConsulToken
-	} else if consulConfig.Token == "" && consulConfig.TokenFile == "" && vipMgrConfig.ConsulToken != "" {
-		slog.Info("Using consul-token from vip-manager config")
-		consulConfig.Token = vipMgrConfig.ConsulToken
 	}
 
 	return consulConfig
@@ -329,6 +341,28 @@ func resolveLockValue(flagValue, triggerValue string, osHostname func() (string,
 		return "", "", errors.New("OS hostname is empty")
 	}
 	return hostname, lockValueSourceOSHostname, nil
+}
+
+// warnIfFlagDiffersFromVipManager warns when the --hostname value differs from
+// the trigger-value vip-manager uses by default on this node (trigger-value
+// from vip-manager.yml, otherwise the OS hostname). They can only match if
+// vip-manager's trigger-value is set by its own flag or environment variable.
+func warnIfFlagDiffersFromVipManager(flagValue, triggerValue string, osHostname func() (string, error)) bool {
+	expected, source := triggerValue, "trigger-value in vip-manager config"
+	if expected == "" {
+		hostname, err := osHostname()
+		if err != nil || hostname == "" {
+			return false
+		}
+		expected, source = hostname, "OS hostname (vip-manager's default trigger-value)"
+	}
+	if flagValue == expected {
+		return false
+	}
+	slog.Warn("--hostname differs from what vip-manager compares the trigger key with: "+
+		"vip-manager will not assign the VIP to this node unless its trigger-value is set to the same value by a flag or environment variable",
+		"hostname", flagValue, "vip_manager_value", expected, "vip_manager_value_source", source)
+	return true
 }
 
 func verifyCheckExists(client *api.Client, checkID string) error {

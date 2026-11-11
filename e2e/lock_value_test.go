@@ -59,7 +59,8 @@ func TestLockValueFromTriggerValue(t *testing.T) {
 
 // TestLockValueDefaultsToOSHostname verifies that without --hostname and
 // trigger-value the lock value is os.Hostname() unmodified, which is what
-// vip-manager compares against by default.
+// vip-manager compares against by default. CI runner hostnames contain no
+// dot, so the FQDN case is covered by the resolveLockValue unit tests.
 func TestLockValueDefaultsToOSHostname(t *testing.T) {
 	client := setupConsulClient(t)
 
