@@ -233,22 +233,32 @@ func loadVipManagerConfig(path string) (*VipManagerConfig, error) {
 }
 
 func createConsulClient(config *Config, vipMgrConfig *VipManagerConfig) (*api.Client, error) {
+	return api.NewClient(buildConsulConfig(config, vipMgrConfig))
+}
+
+// buildConsulConfig returns the Consul client configuration.
+//
+// Address priority: CLI flag > first dcs-endpoints entry > CONSUL_HTTP_ADDR.
+// Only the first endpoint is used, as vip-manager's Consul checker does.
+func buildConsulConfig(config *Config, vipMgrConfig *VipManagerConfig) *api.Config {
 	consulConfig := api.DefaultConfig()
 
-	// Priority: CLI flag > vip-manager.yml > environment variable
 	if config.ConsulAddr != "" {
 		consulConfig.Address = config.ConsulAddr
 	} else if len(vipMgrConfig.DCSEndpoints) > 0 {
-		// Use first endpoint from vip-manager.yml
-		consulConfig.Address = strings.TrimPrefix(vipMgrConfig.DCSEndpoints[0], "http://")
-		consulConfig.Address = strings.TrimPrefix(consulConfig.Address, "https://")
+		// Keep the scheme: api.NewClient switches to HTTPS for an
+		// "https://" address, like vip-manager does for the same endpoint.
+		// Stripping it would connect to a TLS endpoint over plain HTTP.
+		// A trailing slash would become a "/" path prefix and break every
+		// request, while vip-manager ignores it.
+		consulConfig.Address = strings.TrimRight(vipMgrConfig.DCSEndpoints[0], "/")
 	}
 
 	if config.ConsulToken != "" {
 		consulConfig.Token = config.ConsulToken
 	}
 
-	return api.NewClient(consulConfig)
+	return consulConfig
 }
 
 func getShortHostname() (string, error) {

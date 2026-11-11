@@ -88,6 +88,8 @@ consul agent -dev  # In another terminal
 
 ### Configuration Precedence (createConsulClient)
 Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml > `CONSUL_HTTP_ADDR` env
+- The endpoint is passed to the Consul client with its scheme (only a trailing `/` is trimmed). `api.NewClient` switches to HTTPS for `https://`; stripping the scheme would talk plain HTTP to a TLS endpoint, unlike vip-manager
+- Only the first `dcs-endpoints` entry is used, as in vip-manager's Consul checker
 Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 
 ### Session Ownership and Renewal

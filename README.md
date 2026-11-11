@@ -95,6 +95,8 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
 
    See the [vip-manager documentation](https://github.com/cybertec-postgresql/vip-manager#configuration) for full configuration options.
 
+   vip-elector connects to the **first** entry of `dcs-endpoints` only, as vip-manager's Consul checker does. The scheme is honored: an `https://` endpoint is connected to over TLS (see [TLS Configuration](#tls-configuration)).
+
 ### Command-line Options
 
 ```
@@ -105,7 +107,8 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
                       Consul expires the session after up to twice the TTL
 --lock-delay          Time other nodes must wait after the leader's session ends
                       before they can acquire the lock (default: 2s, 0s = no delay)
---addr                Consul address (overrides config and CONSUL_HTTP_ADDR)
+--addr                Consul address, e.g. https://127.0.0.1:8501
+                      (overrides dcs-endpoints and CONSUL_HTTP_ADDR)
 --token               Consul ACL token (overrides CONSUL_HTTP_TOKEN)
 --hostname            Hostname to write to lock value (defaults to short hostname)
 ```
@@ -191,7 +194,7 @@ agent_prefix "" {
 
 ### TLS Configuration
 
-Set environment variables for TLS:
+Use an `https://` address in `dcs-endpoints` (or `--addr`), and set environment variables for the certificates:
 
 ```bash
 export CONSUL_CACERT=/etc/consul.d/ca.pem
