@@ -104,7 +104,7 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
                       Renewed every TTL/2 while vip-elector runs. If the process dies,
                       Consul expires the session after up to twice the TTL
 --lock-delay          Time other nodes must wait after the leader's session ends
-                      before they can acquire the lock (default: 1s, 0s = no delay)
+                      before they can acquire the lock (default: 2s, 0s = no delay)
 --addr                Consul address (overrides config and CONSUL_HTTP_ADDR)
 --token               Consul ACL token (overrides CONSUL_HTTP_TOKEN)
 --hostname            Hostname to write to lock value (defaults to short hostname)
@@ -152,7 +152,7 @@ ExecStart=/usr/local/bin/vip-elector \
   --vip-manager-config=/etc/vip-manager.yml \
   --check-id=vip-http \
   --ttl=10s \
-  --lock-delay=1s
+  --lock-delay=2s
 Restart=always
 RestartSec=2
 
@@ -390,7 +390,7 @@ By default, vip-elector uses the short hostname (before first dot). Override wit
 
 `--lock-delay` keeps other nodes from acquiring the lock right after the leader's session ends. This gives vip-manager on the old leader time to notice the deleted key and remove the VIP before a new leader announces it. It also reduces flapping.
 
-- Keep it longer than vip-manager's `interval`. The default `1s` equals vip-manager's default interval and leaves no margin for a node that starts contending at that moment.
+- Keep it longer than vip-manager's `interval`. The default `2s` leaves about a second of margin over vip-manager's default interval (1000 ms); if you raise vip-manager's `interval`, raise `--lock-delay` with it.
 - A standby that was already waiting is refused once during the lock delay and retries 5 seconds later (fixed by the Consul Lock API), so any value up to `5s` gives the same failover time for it.
 - `0s` disables the delay: a standby can then take over before the old leader's vip-manager has removed the VIP.
 

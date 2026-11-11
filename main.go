@@ -25,8 +25,11 @@ var (
 )
 
 const (
-	defaultTTL       = "10s"
-	defaultLockDelay = "1s"
+	defaultTTL = "10s"
+	// Longer than vip-manager's default interval (1000ms), so that the old
+	// leader's vip-manager has noticed the deleted key and removed the VIP
+	// before another node can acquire the lock.
+	defaultLockDelay = "2s"
 	// Retry lock monitoring briefly on Consul 500/transient unavailability.
 	defaultMonitorRetries   = 3
 	defaultMonitorRetryTime = 10 * time.Second
@@ -149,7 +152,7 @@ func parseFlags() (*Config, error) {
 	flag.StringVar(&config.VipManagerConfigPath, "vip-manager-config", "", "Path to vip-manager.yml (required)")
 	flag.StringVar(&config.CheckID, "check-id", "", "Consul service check ID to associate with session")
 	ttlStr := flag.String("ttl", defaultTTL, "Session TTL (e.g., 10s, 15s)")
-	lockDelayStr := flag.String("lock-delay", defaultLockDelay, "Lock delay to prevent lock flapping (e.g., 1s)")
+	lockDelayStr := flag.String("lock-delay", defaultLockDelay, "Time other nodes must wait after the leader's session ends before acquiring the lock (e.g., 2s)")
 	flag.StringVar(&config.ConsulAddr, "addr", "", "Consul address (overrides vip-manager.yml and CONSUL_HTTP_ADDR)")
 	flag.StringVar(&config.ConsulToken, "token", "", "Consul ACL token (overrides CONSUL_HTTP_TOKEN)")
 	flag.StringVar(&config.Hostname, "hostname", "", "Hostname to use for lock value (defaults to short hostname)")

@@ -113,3 +113,18 @@ func TestDestroySessions_ReturnsFailedOnes(t *testing.T) {
 		t.Errorf("expected no remaining sessions for empty input, got %v", got)
 	}
 }
+
+func TestDefaultLockDelayExceedsVipManagerInterval(t *testing.T) {
+	// vip-manager polls the trigger key every 1000ms by default. The lock
+	// delay must be longer, or another node can acquire the lock before the
+	// old leader's vip-manager has removed the VIP.
+	const vipManagerDefaultInterval = time.Second
+
+	lockDelay, err := time.ParseDuration(defaultLockDelay)
+	if err != nil {
+		t.Fatalf("defaultLockDelay %q is not a duration: %v", defaultLockDelay, err)
+	}
+	if lockDelay <= vipManagerDefaultInterval {
+		t.Errorf("defaultLockDelay=%v must exceed vip-manager's default interval %v", lockDelay, vipManagerDefaultInterval)
+	}
+}
