@@ -13,6 +13,8 @@ vip-elector is a leader election daemon that works in conjunction with [vip-mana
 - `dcs-endpoints` (Consul address list)
 - `trigger-key` (KV path for leader hostname)
 
+Optional fields also read: `trigger-value` (the lock value) and `consul-token` (token fallback).
+
 ## Architecture
 
 ### Core Flow (main.go)
@@ -76,10 +78,9 @@ consul agent -dev  # In another terminal
 
 ## Important Implementation Details
 
-### Hostname Handling (lines 191-203)
-- Defaults to "short hostname" (strips domain after first dot)
-- Override with `--hostname` flag if FQDN is needed
-- The hostname becomes the KV lock value that vip-manager matches against
+### Lock Value (`resolveLockValue`)
+- The value written to the trigger key must equal vip-manager's `trigger-value`, otherwise vip-manager never assigns the VIP (no error on either side)
+- Precedence: `--hostname` flag > `trigger-value` from vip-manager.yml > `os.Hostname()` unmodified (vip-manager's own default; do not shorten it)
 
 ### Health Check Verification (lines 205-216)
 - If `--check-id` is provided, the program verifies it exists in Consul at startup
@@ -91,7 +92,7 @@ Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml 
 - `normalizeEndpoint` reads the endpoint like vip-manager (`url.Parse`, lowercase scheme, scheme + host only, path dropped) and keeps the scheme: `api.NewClient` switches to HTTPS for `https://`; stripping the scheme would talk plain HTTP to a TLS endpoint
 - Only the first `dcs-endpoints` entry is used, as in vip-manager's Consul checker
 - `--addr` is passed to the Consul client unmodified
-Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
+Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN_FILE` env > `CONSUL_HTTP_TOKEN` env (order between the two applied by `api.NewClient`) > `consul-token` from vip-manager.yml. vip-manager's token is last so that a separate vip-elector token (it needs write access) is not overridden by it
 
 ### Session Ownership and Renewal
 - The lock must be held by the session `createSession` returns. Pass it as `LockOptions.Session`; `LockOptions.SessionOpts` makes the Lock API create a second, default session (no TTL, no service check, `Behavior: release`) and ignores the ID

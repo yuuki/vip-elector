@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +45,11 @@ type VipManagerConfig struct {
 	DCSType      string   `yaml:"dcs-type"`
 	DCSEndpoints []string `yaml:"dcs-endpoints"`
 	TriggerKey   string   `yaml:"trigger-key"`
+	// TriggerValue is the value vip-manager compares the trigger key with.
+	// vip-manager defaults it to os.Hostname() when it is not set.
+	TriggerValue string `yaml:"trigger-value"`
+	// ConsulToken is the ACL token vip-manager uses for Consul.
+	ConsulToken string `yaml:"consul-token"`
 }
 
 // Config holds the runtime configuration
@@ -104,16 +108,18 @@ func run() error {
 		return fmt.Errorf("failed to create Consul client: %w", err)
 	}
 
-	// Get hostname
-	hostname := config.Hostname
-	if hostname == "" {
-		hostname, err = getShortHostname()
-		if err != nil {
-			return fmt.Errorf("failed to get hostname: %w", err)
-		}
+	// The value written to the trigger key. It must equal vip-manager's
+	// trigger-value on this node, or vip-manager never assigns the VIP.
+	hostname, source, err := resolveLockValue(config.Hostname, vipMgrConfig.TriggerValue, os.Hostname)
+	if err != nil {
+		return fmt.Errorf("failed to get hostname: %w", err)
 	}
 
-	slog.Info("Using hostname", "hostname", hostname)
+	slog.Info("Using lock value", "value", hostname, "source", source)
+	if source == lockValueSourceFlag && vipMgrConfig.TriggerValue != "" && hostname != vipMgrConfig.TriggerValue {
+		slog.Warn("--hostname differs from trigger-value in vip-manager config: vip-manager will not assign the VIP to this node unless its trigger-value is overridden by a flag or environment variable",
+			"hostname", hostname, "trigger_value", vipMgrConfig.TriggerValue)
+	}
 
 	// Verify check exists (if specified)
 	if config.CheckID != "" {
@@ -156,7 +162,7 @@ func parseFlags() (*Config, error) {
 	lockDelayStr := flag.String("lock-delay", defaultLockDelay, "Time other nodes must wait after the leader's session ends before acquiring the lock (e.g., 2s)")
 	flag.StringVar(&config.ConsulAddr, "addr", "", "Consul address (overrides vip-manager.yml and CONSUL_HTTP_ADDR)")
 	flag.StringVar(&config.ConsulToken, "token", "", "Consul ACL token (overrides CONSUL_HTTP_TOKEN)")
-	flag.StringVar(&config.Hostname, "hostname", "", "Hostname to use for lock value (defaults to short hostname)")
+	flag.StringVar(&config.Hostname, "hostname", "", "Value to write to the trigger key; must match vip-manager's trigger-value (defaults to trigger-value from vip-manager.yml, then the OS hostname)")
 
 	flag.Parse()
 
@@ -259,8 +265,16 @@ func buildConsulConfig(config *Config, vipMgrConfig *VipManagerConfig) *api.Conf
 		consulConfig.Address = normalizeEndpoint(vipMgrConfig.DCSEndpoints[0])
 	}
 
+	// Token priority: --token > CONSUL_HTTP_TOKEN_FILE > CONSUL_HTTP_TOKEN
+	// (the order between the two variables is applied by api.NewClient) >
+	// consul-token from vip-manager.yml. vip-manager's token comes last so
+	// that a separate token for vip-elector (it needs session and key write
+	// access, vip-manager only key read) is not overridden by it.
 	if config.ConsulToken != "" {
 		consulConfig.Token = config.ConsulToken
+	} else if consulConfig.Token == "" && consulConfig.TokenFile == "" && vipMgrConfig.ConsulToken != "" {
+		slog.Info("Using consul-token from vip-manager config")
+		consulConfig.Token = vipMgrConfig.ConsulToken
 	}
 
 	return consulConfig
@@ -290,18 +304,31 @@ func normalizeEndpoint(endpoint string) string {
 	}
 }
 
-func getShortHostname() (string, error) {
-	hostname, err := os.Hostname()
+const (
+	lockValueSourceFlag         = "--hostname"
+	lockValueSourceTriggerValue = "trigger-value"
+	lockValueSourceOSHostname   = "os-hostname"
+)
+
+// resolveLockValue returns the value to write to the trigger key and where
+// it came from. vip-manager assigns the VIP when the key equals its
+// trigger-value, which defaults to os.Hostname() unmodified, so the same
+// precedence applies here with the --hostname flag on top.
+func resolveLockValue(flagValue, triggerValue string, osHostname func() (string, error)) (string, string, error) {
+	if flagValue != "" {
+		return flagValue, lockValueSourceFlag, nil
+	}
+	if triggerValue != "" {
+		return triggerValue, lockValueSourceTriggerValue, nil
+	}
+	hostname, err := osHostname()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-
-	// Return short hostname (before first dot)
-	if idx := strings.Index(hostname, "."); idx != -1 {
-		return hostname[:idx], nil
+	if hostname == "" {
+		return "", "", errors.New("OS hostname is empty")
 	}
-
-	return hostname, nil
+	return hostname, lockValueSourceOSHostname, nil
 }
 
 func verifyCheckExists(client *api.Client, checkID string) error {
