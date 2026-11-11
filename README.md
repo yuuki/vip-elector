@@ -101,7 +101,9 @@ Download from [releases page](https://github.com/yuuki/vip-elector/releases).
 
 ```
 --vip-manager-config  Path to vip-manager.yml (required)
---check-id            Consul service check ID to link to session (e.g., vip-http)
+--check-id            Consul service check ID to link to session (e.g., vip-http).
+                      It must be registered on the local Consul agent and not
+                      critical for this node to take part in the election
 --ttl                 Session TTL (default: 10s, Consul's minimum; must be > 0).
                       Renewed every TTL/2 while vip-elector runs. If the process dies,
                       Consul expires the session after up to twice the TTL
@@ -194,6 +196,13 @@ key_prefix "network/sakura-internal/vip/" {
 agent_prefix "" {
   policy = "read"
 }
+
+# Optional: lets the startup check see the --check-id service check.
+# Without it the agent hides the check and vip-elector warns that it
+# was not found (the session itself still works).
+service_prefix "" {
+  policy = "read"
+}
 ```
 
 ### TLS Configuration
@@ -245,9 +254,11 @@ Network partition or node crash → Consul agent disconnects → Session invalid
 - `ERROR: Lock acquisition failed (error_type=lock_conflict)` - Trigger key is incompatible with Lock API; process exits
 - `WARN: SESSION LOST` - Consul reports the session no longer exists; re-entering election
 - `WARN: Failed to renew session, retrying` - Consul did not answer a TTL renewal; retried every second
-- `ERROR: Failed to create session` - Consul connectivity issues
+- `ERROR: Failed to create session` - Consul connectivity issues, or (with a `hint`) a health check of the session is missing from the Consul catalog for this node (not registered on the local agent, or not synced yet) or is critical. vip-elector retries with backoff; the node does not take part in the election meanwhile
 - `ERROR: Failed to destroy session` - Consul did not confirm the session was destroyed; retried on the next election attempt, otherwise the session expires with its TTL
-- `WARN: Health check verification failed` - Check ID not found
+- `WARN: Health check not found on the local Consul agent` - The `--check-id` check does not exist (yet), or the ACL token cannot read it (`service:read`). If it does not exist, Consul refuses to create the session until it does, so vip-elector keeps retrying and the node is not a candidate meanwhile. Check for a typo, or for the service being registered later at boot
+- `WARN: Health check is critical` - The `--check-id` check exists but is critical at startup; no session can be created until it is no longer critical
+- `WARN: Could not look up the health check on the local Consul agent` - The startup lookup failed (Consul unreachable, or an ACL error); vip-elector continues, and a missing or critical check then shows up as `Failed to create session` with a `hint`
 
 ### Verification
 

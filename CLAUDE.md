@@ -85,10 +85,13 @@ consul agent -dev  # In another terminal
 - Precedence: `--hostname` flag > `trigger-value` from vip-manager.yml > `os.Hostname()` unmodified (vip-manager's own default; do not shorten it)
 - `warnIfFlagDiffersFromVipManager` warns when `--hostname` differs from vip-manager's default value on this node
 
-### Health Check Verification (lines 205-216)
-- If `--check-id` is provided, the program verifies it exists in Consul at startup
-- Missing check ID generates a WARNING but doesn't fail startup
-- Without a valid check ID, health-based failover won't work (session won't invalidate on health failures)
+### Health Check Verification (`lookupAgentCheck`, `checkWarning`)
+- If `--check-id` is provided, the program looks it up on the local Consul agent at startup
+- The agent hides service checks from a token without `service:read` and does not tell the Go client (the agent endpoint sends no `X-Consul-LastContact`, so `QueryMeta.ResultsFilteredByACLs` is never parsed). "Not found" may therefore mean "hidden"; the warning says so
+- A missing or critical check generates a WARNING but doesn't fail startup. The check ID is still sent: Consul refuses to create the session (`Missing check '<id>' registration`), and the election loop keeps retrying, so the node is not a candidate until the check is registered. This covers the service being registered after vip-elector starts at boot
+- Never drop the check ID to "continue without it": that would silently turn a typo into a node that never fails over on health
+- Consul also refuses to create a session while one of its checks is critical (`Check '<id>' is in critical state`; `warning` is accepted). `sessionCreateHint` adds a `hint` to the error log for both cases
+- Consul validates the checks against the catalog entry of this node, not the agent: a check registered on the agent but not yet synced also fails session creation, which is one more reason to retry rather than exit
 
 ### Configuration Precedence (createConsulClient)
 Address resolution: `--addr` CLI flag > `dcs-endpoints[0]` from vip-manager.yml (`dcs-endpoints` is required, so `CONSUL_HTTP_ADDR` never applies)
@@ -115,6 +118,7 @@ Token resolution: `--token` CLI flag > `CONSUL_HTTP_TOKEN` env
 session "write" {}  # Create sessions
 key_prefix "your-trigger-prefix/" { policy = "write" }  # KV lock operations
 agent_prefix "" { policy = "read" }  # Check verification
+service_prefix "" { policy = "read" }  # Optional: lets the startup check see the --check-id service check
 ```
 
 ### Environment Variables Supported
@@ -130,7 +134,7 @@ These are handled by the Consul SDK's `api.DefaultConfig()` automatically.
 When a session invalidates, the KV entry is deleted entirely. This is intentional: vip-manager interprets a missing or non-matching value as "not this node's VIP", preventing split-brain scenarios.
 
 ### Why Verify Check ID at Startup?
-Early validation prevents misconfiguration. A typo in check-id would result in a session that never invalidates on health failures, defeating the purpose of health-based failover.
+Early validation makes misconfiguration visible. A typo in check-id means the session can never be created, so the node never becomes a candidate; the startup warning says so instead of leaving only repeated session creation errors.
 
 ### Why Exponential Backoff?
 Consul may be temporarily unavailable during deployments or network issues. Exponential backoff (max 30s) prevents tight retry loops while allowing reasonable recovery time.

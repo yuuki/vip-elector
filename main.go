@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -141,11 +142,15 @@ func run() error {
 		warnIfFlagDiffersFromVipManager(hostname, triggerValue, os.Hostname)
 	}
 
-	// Verify check exists (if specified)
+	// Look up the check (if specified). This only warns; see checkWarning.
 	if config.CheckID != "" {
-		if err := verifyCheckExists(consulClient, config.CheckID); err != nil {
-			slog.Warn("Health check verification failed", "error", err)
-			slog.Warn("Session will be created without service check - health-based failover will not work")
+		st, err := lookupAgentCheck(consulClient.Agent(), config.CheckID)
+		if msg := checkWarning(st, err); msg != "" {
+			if err != nil {
+				slog.Warn(msg, "check_id", config.CheckID, "error", err)
+			} else {
+				slog.Warn(msg, "check_id", config.CheckID)
+			}
 		}
 	}
 
@@ -365,17 +370,77 @@ func warnIfFlagDiffersFromVipManager(flagValue, triggerValue string, osHostname 
 	return true
 }
 
-func verifyCheckExists(client *api.Client, checkID string) error {
-	checks, err := client.Agent().Checks()
+// agentCheckStatus is what the local Consul agent reports about a check.
+type agentCheckStatus struct {
+	Found  bool
+	Status string // when Found
+}
+
+// agentChecks is an interface for listing agent checks (implemented by
+// *api.Agent), allowing for testing with mocks.
+type agentChecks interface {
+	Checks() (map[string]*api.AgentCheck, error)
+}
+
+// lookupAgentCheck looks the check up on the local agent. The agent hides
+// service checks from an ACL token without service:read, and does not tell
+// the Go client so, so a check that is not found may still exist.
+func lookupAgentCheck(agent agentChecks, checkID string) (agentCheckStatus, error) {
+	checks, err := agent.Checks()
 	if err != nil {
-		return fmt.Errorf("failed to query checks: %w", err)
+		return agentCheckStatus{}, fmt.Errorf("failed to query checks: %w", err)
 	}
 
-	if _, exists := checks[checkID]; !exists {
-		return fmt.Errorf("check ID '%s' not found in Consul agent", checkID)
+	if check, ok := checks[checkID]; ok && check != nil {
+		return agentCheckStatus{Found: true, Status: check.Status}, nil
 	}
+	return agentCheckStatus{}, nil
+}
 
-	return nil
+// checkWarning returns the startup warning for the --check-id lookup, or ""
+// if there is nothing to warn about. vip-elector never drops the check: that
+// would silently turn a typo into a node that never fails over on health.
+// Consul refuses to create a session whose check is missing or critical, and
+// the election loop keeps retrying, so the node is not a candidate until the
+// check exists and is not critical (e.g. the service is registered after
+// vip-elector starts at boot).
+func checkWarning(st agentCheckStatus, err error) string {
+	const consequence = "no session can be created until it is, so this node does not take part in the election meanwhile; vip-elector keeps retrying"
+	switch {
+	case err != nil:
+		return "Could not look up the health check on the local Consul agent. " +
+			"If it is not registered, " + consequence
+	case !st.Found:
+		return "Health check not found on the local Consul agent. " +
+			"If it is not registered, " + consequence + ". " +
+			"Check --check-id for typos; an ACL token without service:read also hides it from this lookup"
+	case st.Status == api.HealthCritical:
+		return "Health check is critical: no session can be created until it is no longer critical, " +
+			"so this node does not take part in the election meanwhile; vip-elector keeps retrying"
+	default:
+		return ""
+	}
+}
+
+// sessionCreateHint explains the session creation errors Consul returns for
+// the checks a session is tied to, or returns "" for any other error.
+// Consul validates the checks against the catalog entry of this node, which
+// the local agent keeps in sync with its own registrations.
+func sessionCreateHint(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "Missing check"):
+		// "Missing check '<id>' registration"
+		return "a health check of the session is not registered in the Consul catalog for this node " +
+			"(not registered on the local agent, or not synced yet); " +
+			"this node cannot take part in the election until it is"
+	case strings.Contains(msg, "in critical state"):
+		// "Check '<id>' is in critical state"
+		return "a health check of the session is critical; " +
+			"this node cannot take part in the election until it is no longer critical"
+	default:
+		return ""
+	}
 }
 
 // kvGetter is an interface for getting KV pairs, allowing for testing with mocks
@@ -450,7 +515,11 @@ func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipM
 		// Create session
 		sessionID, err := createSession(client, config, hostname)
 		if err != nil {
-			slog.Error("Failed to create session", "error", err)
+			if hint := sessionCreateHint(err); hint != "" {
+				slog.Error("Failed to create session", "error", err, "hint", hint)
+			} else {
+				slog.Error("Failed to create session", "error", err)
+			}
 			slog.Info("Retrying", "backoff", backoff)
 			select {
 			case <-time.After(backoff):
