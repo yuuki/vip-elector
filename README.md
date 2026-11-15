@@ -1,5 +1,10 @@
 # vip-elector
 
+[![CI](https://github.com/yuuki/vip-elector/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/vip-elector/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/vip-elector)](https://github.com/yuuki/vip-elector/releases)
+[![License](https://img.shields.io/github/license/yuuki/vip-elector)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/vip-elector)](go.mod)
+
 A leader election daemon using Consul Session and KV Lock, designed to work with [vip-manager](https://github.com/cybertec-postgresql/vip-manager) for HTTP health-based VIP failover without Patroni.
 
 > **⚠️ Important**: This tool is designed to work in conjunction with [vip-manager](https://github.com/cybertec-postgresql/vip-manager). vip-elector alone does not manage VIPs - it only performs leader election. You must install and run both vip-elector and vip-manager to achieve automatic VIP failover.
