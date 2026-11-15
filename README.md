@@ -2,6 +2,7 @@
 
 [![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
 [![CI](https://github.com/yuuki/vip-elector/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/vip-elector/actions/workflows/test.yml)
+[![Security](https://github.com/yuuki/vip-elector/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/vip-elector/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/yuuki/vip-elector)](https://github.com/yuuki/vip-elector/releases)
 [![License](https://img.shields.io/github/license/yuuki/vip-elector)](LICENSE)
 [![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/vip-elector)](go.mod)
