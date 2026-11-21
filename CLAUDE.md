@@ -4,31 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-vip-elector is a leader election daemon that works in conjunction with [vip-manager](https://github.com/cybertec-postgresql/vip-manager). It performs distributed leader election using Consul Session and KV Lock, while vip-manager handles the actual VIP (Virtual IP) assignment. **Both tools are required for a complete VIP failover solution.**
+vip-elector is a leader election daemon that works in conjunction with [vip-manager](https://github.com/cybertec-postgresql/vip-manager). It performs distributed leader election using Consul Session and KV Lock, or an etcd lease, while vip-manager handles the actual VIP (Virtual IP) assignment. **Both tools are required for a complete VIP failover solution.**
 
 ### Critical Design Principle
 
-**Configuration as Single Source of Truth**: vip-elector reads `vip-manager.yml` to obtain Consul endpoints and the trigger key. This ensures both vip-elector and vip-manager use consistent configuration without duplication. The three required fields from vip-manager.yml are:
-- `dcs-type` (must be "consul")
-- `dcs-endpoints` (Consul address list)
+**Configuration as Single Source of Truth**: vip-elector reads `vip-manager.yml` to obtain the DCS endpoints and the trigger key. This ensures both vip-elector and vip-manager use consistent configuration without duplication. The three required fields from vip-manager.yml are:
+- `dcs-type` (`consul`, or `etcd` / `etcd3` as in vip-manager; case-sensitive like vip-manager)
+- `dcs-endpoints` (DCS address list)
 - `trigger-key` (KV path for leader hostname)
 
-Optional field also read: `trigger-value` (the lock value). It must be a YAML string (`yamlString`): vip-manager reads the file through viper, which converts numbers and booleans (`01` → `1`), so unquoted ones are rejected.
+Optional field also read: `trigger-value` (the lock value). It must be a YAML string (`yamlString`): vip-manager reads the file through viper, which converts numbers and booleans (`01` → `1`), so unquoted ones are rejected. With etcd, `etcd-ca-file` (also a `yamlString`) is read too, since verifying the server is the same for both tools.
 
-`consul-token` is deliberately not read: vip-manager needs only key read access while vip-elector needs session and key write access, so falling back to vip-manager's token could break a setup that works with the agent's default token.
+`consul-token` is deliberately not read: vip-manager needs only key read access while vip-elector needs session and key write access, so falling back to vip-manager's token could break a setup that works with the agent's default token. For the same reason vip-manager's `etcd-user`, `etcd-password`, `etcd-cert-file` and `etcd-key-file` are not used; `etcd-user` and `etcd-cert-file` are read (as plain strings) only to warn that vip-elector has no credentials of its own.
 
 ## Architecture
 
-### Core Flow (main.go)
+### Core Flow
 
-The program follows a single-file architecture with a clear execution flow:
+`main.go` holds what does not depend on the DCS (flags, vip-manager.yml, lock value, signals) and `run()` dispatches on `dcs-type` to `runConsul` (`consul.go`) or `runEtcd` (`etcd.go`). `validateDCSConfig` rejects flags that do not apply to the selected DCS instead of ignoring them (`--check-id`, `--addr`, `--token` with etcd; `--etcd-*` with Consul). Ignoring `--check-id` would leave a node that is believed to fail over on health but does not.
 
-1. **Configuration Priority Chain** (lines 172-188):
+1. **Configuration Priority Chain**:
    - CLI flags override vip-manager.yml
    - vip-manager.yml overrides environment variables
    - Environment variables are the fallback
 
-2. **Election Loop** (`runElectionLoop`):
+2. **Election Loop** (`runElectionLoop`, Consul):
    - Creates Consul Session with `Behavior: "delete"` so keys are auto-cleaned on session invalidation
    - Session includes `ServiceChecks` to tie leader election to HTTP health status
    - Renews the session TTL in the background (`startSessionKeepalive` / `renewSession`)
@@ -77,6 +77,8 @@ Run against local Consul:
 consul agent -dev  # In another terminal
 ./vip-elector --vip-manager-config=test-config.yml
 ```
+
+For etcd, use `dcs-type: etcd`, `dcs-endpoints: ["http://127.0.0.1:2379"]` and a key such as `/test/vip/lock`, and start etcd with `make etcd-up` (or `etcd` in another terminal).
 
 ## Important Implementation Details
 
@@ -129,6 +131,32 @@ service_prefix "" { policy = "read" }  # Optional: lets the startup check see th
 
 These are handled by the Consul SDK's `api.DefaultConfig()` automatically.
 
+## etcd Integration Specifics
+
+### Election (`etcdElector`)
+- Each attempt grants a lease (`--ttl`, whole seconds: `validateDCSConfig` rejects fractions; etcd silently raises a TTL below its minimum, so `grantLease` warns) and keeps it alive with `startLeaseKeepalive`
+- The key is taken by `tryAcquire`: a txn `CreateRevision(key) == 0` → `Put(key, value, WithLease)`. etcd deletes the key when the lease is revoked or expires, which is what `Behavior: "delete"` does for Consul
+- etcd has no lock-delay: `campaign` waits `--lock-delay` every time it finds the key free, also at startup (it cannot tell how recently the key was deleted). The delay is only kept by vip-elector nodes
+- `campaign` treats a key already held by its own lease as acquired (a txn that timed out on the client after etcd applied it); otherwise this node would hold the key without watching it
+- A key without a lease (`Lease == 0`, e.g. `etcdctl put`) never expires: `verifyEtcdKeyState` refuses it at startup and `campaign` refuses it later (`plainKeyError`, fatal like Consul's lock conflict). A standby's wait also ends on a plain write over the held key, so it is reported instead of waited on forever
+- Leadership ends (`holdLock`) when the key is deleted or written by another lease, or `keepalive.lost` closes. Giving up always revokes the lease; a revoke that fails is retried before the next attempt (`staleLeases`), otherwise the lease expires with its TTL. `ErrLeaseNotFound` counts as revoked
+- The run loop logs why an attempt ended before it revokes the lease
+- Unlike Consul, leadership is given up when the etcd client has had no keepalive answer for the TTL: the client closes the KeepAlive channel then, and etcd expires the lease and deletes the key anyway. vip-manager has dropped the VIP before that (it sends `false` on any failed read)
+
+### Watches and Requests
+- `waitForKey` watches from the read revision + 1 with `clientv3.WithRequireLeader`, so a member cut off from the cluster cancels the watch instead of staying silent. When a watch ends (compaction, no leader) it re-reads the key and watches again; read errors are retried every `etcdRereadInterval` until the lease is lost
+- Every request has a deadline (`etcdRequestTimeout`, 5s): the etcd client retries an unreachable cluster until its context ends
+- gRPC keepalive pings stay above 5s (`etcdDialKeepAliveTime`): the etcd server closes connections that ping more often (`--grpc-keepalive-min-time`)
+
+### Connection Settings (`resolveEtcdSettings`, `buildEtcdTLS`)
+- All `dcs-endpoints` are passed to the etcd client as is (it fails over between them), as vip-manager does
+- CA: `--etcd-ca-file` > `etcd-ca-file` in vip-manager.yml > `ETCDCTL_CACERT`. Client certificate: `--etcd-cert-file`/`--etcd-key-file` > `ETCDCTL_CERT`/`ETCDCTL_KEY`. User: `--etcd-user`/`--etcd-password` > `ETCDCTL_USER`/`ETCDCTL_PASSWORD`; a user `name:password` without a password is split at the first colon, like etcdctl
+- The etcd client connects to `http://` endpoints without TLS even when a TLS config is set (`CredsDrop`), so `etcdSettingsWarnings` warns. `https://` without a CA file uses the system CAs. A CA file without a PEM certificate is an error (vip-manager ignores it and then fails every handshake)
+- The etcd client logger keeps only errors (its warnings repeat on every retry). Those warnings are the only place that says why a connection fails, so `ETCD_CLIENT_DEBUG` (read with `clientv3.ClientLogLevel`, as the client does) lowers the level, and `etcdConnectHint` says so on a pre-flight timeout
+
+### Required Permissions
+With etcd auth: `readwrite` on the trigger key for vip-elector, `read` for vip-manager. Granting a lease needs only a valid user; revoking it needs write access to the attached key.
+
 ## Common Issues and Design Rationale
 
 ### Why Behavior: "delete"?
@@ -150,6 +178,7 @@ Automatic re-election after lock loss enables nodes to reclaim leadership when t
 
 ## Testing Considerations
 
-- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `lock_value_test.go`, `session_config_test.go`, `session_keepalive_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`)
-- E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` (docker-compose, or `consul agent -dev`)
+- Unit tests: `make test` (`main_test.go`, `consul_client_test.go`, `lock_behavior_test.go`, `lock_value_test.go`, `session_config_test.go`, `session_keepalive_test.go`, `etcd_config_test.go`, `etcd_election_test.go`). Consul calls are mocked through small interfaces (`kvGetter`, `sessionRenewer`); etcd calls through fakes of the etcd client's `KV`, `Lease` and `Watcher` interfaces (`fakeKV`, `fakeLease`, `fakeWatcher`)
+- E2E tests: `make test-e2e` (`e2e/`, build tag `e2e`). They need a real Consul agent on `127.0.0.1:8500` and etcd on `127.0.0.1:2379` (`make dcs-up`, or `consul agent -dev` and `etcd`). The etcd image has no shell, so it is configured through `ETCD_*` environment variables (GitHub service containers cannot override the command) and checked with `etcdctl` or `/health`
 - E2E scenarios include: standby exiting promptly on SIGTERM, lock value from `trigger-value` / OS hostname / `--hostname`, lock held by the configured session, session renewal past the TTL, health-check failover, SIGKILL failover, graceful shutdown deleting the key, session destroyed after lock loss, standby recovering from a lost session
+- etcd E2E scenarios (`e2e/etcd_test.go`): lease TTL, lock value from `trigger-value`, concurrent startup, graceful failover only after lock-delay, SIGKILL failover through the lease TTL, prompt standby shutdown revoking its lease, lease revoked or key deleted by someone else, plain key refused, Consul-only flags and fractional TTL refused
