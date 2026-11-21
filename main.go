@@ -151,24 +151,36 @@ func run() error {
 		warnIfFlagDiffersFromVipManager(hostname, triggerValue, os.Hostname)
 	}
 
-	// Setup signal handling
+	if vipMgrConfig.DCSType == dcsTypeConsul {
+		return runConsul(config, vipMgrConfig, hostname)
+	}
+	return runEtcd(config, vipMgrConfig, hostname)
+}
+
+// shutdownContext returns a context that SIGINT or SIGTERM cancels, and a
+// function that stops handling the signals. The backends call it only after
+// their pre-flight checks: those cannot be cancelled (the Consul client takes
+// no context there), and until then the default action ends the process at
+// once, with nothing to clean up.
+func shutdownContext() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
 
 	go func() {
-		sig := <-sigCh
-		slog.Info("Received signal, initiating shutdown", "signal", sig)
-		cancel()
+		select {
+		case sig := <-sigCh:
+			slog.Info("Received signal, initiating shutdown", "signal", sig)
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
-	if vipMgrConfig.DCSType == dcsTypeConsul {
-		return runConsul(ctx, config, vipMgrConfig, hostname)
+	return ctx, func() {
+		signal.Stop(sigCh)
+		cancel()
 	}
-	return runEtcd(ctx, config, vipMgrConfig, hostname)
 }
 
 func parseFlags() (*Config, error) {

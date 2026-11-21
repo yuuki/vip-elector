@@ -175,17 +175,18 @@ interface: bond0
 interval: 1000
 ```
 
-- All `dcs-endpoints` are used; the etcd client moves to the next one when an endpoint cannot be reached, as in vip-manager. An `https://` endpoint is connected to over TLS, with the system CA certificates unless a CA file is set.
+- All `dcs-endpoints` are used; the etcd client moves to the next one when an endpoint cannot be reached, as in vip-manager. TLS is used for all endpoints unless the **first** one starts with `http://` (the etcd client decides once, from the first endpoint; vip-elector warns when the list mixes `http://` with other schemes). An endpoint without a scheme (`10.0.0.1:2379`) is therefore connected to with TLS, as in vip-manager. The system CA certificates verify the server unless a CA file is set.
 - `etcd-ca-file` from vip-manager.yml is used, because both tools verify the same etcd server.
 - vip-manager's `etcd-user`, `etcd-password`, `etcd-cert-file` and `etcd-key-file` are **not** used: vip-manager only needs to read the trigger key, while vip-elector writes it. Give vip-elector its own credentials with `--etcd-user`/`--etcd-password` or `--etcd-cert-file`/`--etcd-key-file`, or the `ETCDCTL_*` variables. vip-elector warns at startup when vip-manager.yml has credentials and vip-elector has none.
-- `--check-id` is refused: etcd has no health checks a lease can be tied to. Leadership moves when vip-elector stops, dies, or loses its connection to etcd. To move the VIP when the service itself stops, stop vip-elector with it (for example with a systemd `BindsTo=` dependency on the service).
+- `--check-id` is refused: etcd has no health checks a lease can be tied to. Leadership moves when vip-elector stops, dies, or cannot reach etcd for the TTL. To move the VIP when the service itself stops, stop vip-elector with it (for example with a systemd `BindsTo=` dependency on the service).
+- Use a trigger-key that only vip-elector writes. etcd keys carry no marker like the flag of a Consul lock, so vip-elector cannot tell a key another program holds with a lease (for example Patroni's leader key) from a vip-elector lock: it would wait for that key and take it over whenever it is absent for `--lock-delay`.
 
 How the election works on etcd:
 
-1. vip-elector grants a lease with the `--ttl` and keeps it alive (the etcd client renews it every TTL/3)
+1. vip-elector grants a lease with the `--ttl` and renews it every TTL/3. Each renewal has its own deadline and may go to another etcd member, so that one hung member does not let the lease expire
 2. It writes its hostname to the trigger-key, attached to the lease, in a transaction that succeeds only if the key does not exist
 3. A standby watches the key. When the key is deleted, the standby waits `--lock-delay` and then tries to take it
-4. When the lease is revoked (graceful shutdown) or expires (the process or the node died, or it lost its connection to etcd for the TTL), etcd deletes the key, and vip-manager removes the VIP
+4. When the lease is revoked (graceful shutdown) or expires (the process or the node died, or its renewals did not reach etcd for the TTL), etcd deletes the key, and vip-manager removes the VIP
 
 ## Usage
 
@@ -299,7 +300,7 @@ export CONSUL_CLIENT_CERT=/etc/consul.d/client.pem
 export CONSUL_CLIENT_KEY=/etc/consul.d/client-key.pem
 ```
 
-With etcd, use `https://` endpoints, and `etcd-ca-file` in vip-manager.yml (or `--etcd-ca-file`, `ETCDCTL_CACERT`) for a private CA. A client certificate goes in `--etcd-cert-file`/`--etcd-key-file` or `ETCDCTL_CERT`/`ETCDCTL_KEY`. An `http://` endpoint is connected to without TLS even when certificates are set; vip-elector warns about it.
+With etcd, use `https://` endpoints, and `etcd-ca-file` in vip-manager.yml (or `--etcd-ca-file`, `ETCDCTL_CACERT`) for a private CA. A client certificate goes in `--etcd-cert-file`/`--etcd-key-file` or `ETCDCTL_CERT`/`ETCDCTL_KEY`. If the first endpoint starts with `http://`, all endpoints are connected to without TLS even when certificates are set; vip-elector warns about it.
 
 ## Failover Scenarios
 
@@ -336,7 +337,8 @@ Network partition or node crash → Consul agent disconnects → Session invalid
 
 - **Process stop**: vip-elector revokes its lease → etcd deletes the trigger-key at once → a waiting standby takes it after `--lock-delay` (2 seconds by default).
 - **Process killed, node crash**: nothing renews the lease, and etcd deletes the key when the TTL ends (10 seconds by default, counted from the last renewal). A standby takes it after `--lock-delay` more.
-- **Leader cut off from etcd**: vip-manager on that node cannot read the key and removes the VIP within its `interval`. etcd expires the lease after the TTL, and the standby takes over after `--lock-delay` more. vip-elector on the cut-off node gives up leadership when the etcd client has had no answer to a renewal for the TTL.
+- **Leader cut off from etcd**: vip-manager on that node cannot read the key and removes the VIP within its `interval`. etcd expires the lease after the TTL, and the standby takes over after `--lock-delay` more. vip-elector on the cut-off node keeps retrying its renewals and learns that the lease is gone once it reaches etcd again.
+- **etcd down or without quorum**: no node can read the key, so vip-manager removes the VIP everywhere. etcd keeps its leases through the outage, so when it is back the leader renews its lease and keeps the key, and vip-manager assigns the VIP to it again.
 - **HTTP health check failure**: not detected; see [Using etcd](#using-etcd).
 
 ## Monitoring
@@ -358,9 +360,10 @@ Network partition or node crash → Consul agent disconnects → Session invalid
 With etcd:
 
 - `INFO: Lock is held by another node, waiting` - This node is a standby (`holder` is the leader's value)
-- `INFO: Trigger key is free, waiting lock-delay before taking it` - Also logged at startup: vip-elector cannot tell how recently the key was deleted, so it always waits
+- `INFO: Trigger key is free, waiting lock-delay before taking it` - Also logged at startup: vip-elector cannot tell how recently the key was deleted, so it always waits. Logged again when another node took and released the key during the wait
 - `WARN: LOCK LOST` - The key was deleted or written by someone else; re-entering election
-- `WARN: LEASE LOST` - The lease expired, was revoked by someone else, or the etcd client had no answer to a renewal for the TTL; re-entering election
+- `WARN: LEASE LOST` - etcd reports the lease gone (it expired, or someone else revoked it); re-entering election
+- `WARN: Failed to renew lease, retrying` - A renewal got no answer in time (etcd unreachable, or a hung member); retried at once, possibly on another member, for as long as etcd does not answer
 - `WARN: Lease lost while waiting for lock` - The same for a standby
 - `ERROR: Lock acquisition failed` - An etcd request failed (e.g. `permission denied`, or etcd unreachable); retried with backoff
 - `ERROR: Failed to revoke lease` - etcd did not confirm; retried before the next attempt, otherwise the lease expires with its TTL
@@ -549,11 +552,13 @@ Quote a `trigger-value` that YAML would read as a number, boolean or date (`"01"
 - A standby that was already waiting is refused once during the lock delay and retries 5 seconds later (fixed by the Consul Lock API), so any value up to `5s` gives the same failover time for it.
 - `0s` disables the delay: a standby can then take over before the old leader's vip-manager has removed the VIP.
 
-etcd has no lock delay of its own. With etcd, every vip-elector waits `--lock-delay` after it finds the trigger-key free before it takes it, also at startup, because it cannot tell how recently the key was deleted. A standby therefore takes over exactly `--lock-delay` after the key is deleted (there is no 5-second retry as with Consul). The delay is kept by vip-elector, not by etcd: another program writing the key is not held back.
+etcd has no lock delay of its own. With etcd, every vip-elector waits `--lock-delay` after it finds the trigger-key free before it takes it, also at startup, because it cannot tell how recently the key was deleted. It watches the key during the wait, and starts the wait over if another node takes the key (and maybe releases it again) meanwhile, so the delay always counts from the last release. A standby therefore takes over exactly `--lock-delay` after the key is deleted (there is no 5-second retry as with Consul). The delay is kept by vip-elector, not by etcd: another program writing the key is not held back.
 
 ### Lease TTL and renewal (etcd)
 
-The lock is held by a lease of `--ttl` (whole seconds; etcd raises values below its minimum). The etcd client renews it every TTL/3. Unlike a Consul session, vip-elector gives up leadership when the etcd client has had no answer to a renewal for the TTL, because by then etcd has expired the lease (or will, as soon as it can) and deleted the key. vip-manager on the same node has removed the VIP before that, as soon as it could not read the key.
+The lock is held by a lease of `--ttl` (whole seconds; etcd raises values below its minimum). vip-elector renews it every TTL/3 with separate requests, each with a deadline of half that interval, instead of the etcd client's keepalive stream. That stream stays on one etcd member and moves only when gRPC declares the connection dead, which takes at least 15 seconds; if that member hung, the other members would let the lease expire meanwhile. A separate request goes to the next member.
+
+As with a Consul session, renewal errors are retried for as long as etcd does not answer, and leadership is given up only when etcd reports the lease gone (or the key is deleted). etcd keeps leases through a loss of quorum or a restart, so a leader keeps its key across an etcd outage. vip-manager removes the VIP while it cannot read the key, so this does not leave a VIP on a node that etcd no longer sees as leader.
 
 ## Comparison with Alternatives
 

@@ -24,20 +24,27 @@ const (
 	// unreachable cluster until the context ends, so every request needs a
 	// deadline to report the failure at all.
 	etcdRequestTimeout = 5 * time.Second
-	// gRPC keepalive pings detect a dead connection to an etcd member. The
-	// etcd server closes connections that ping more often than every 5s
-	// (--grpc-keepalive-min-time), so stay above that.
+	// gRPC keepalive pings detect a dead connection to an etcd member. gRPC
+	// pings no more often than every 10s, and the etcd server closes
+	// connections that ping more often than every 5s
+	// (--grpc-keepalive-min-time). Lease renewal does not rely on this (see
+	// renewLease).
 	etcdDialKeepAliveTime    = 10 * time.Second
 	etcdDialKeepAliveTimeout = 5 * time.Second
 )
 
-// How long to wait before reading the trigger key again when a read failed
-// after a watch ended. A variable so that tests can shorten it.
-var etcdRereadInterval = time.Second
+var (
+	// How long to wait before reading the trigger key again when a read
+	// failed after a watch ended. A variable so that tests can shorten it.
+	etcdRereadInterval = time.Second
+	// How long to wait before retrying a failed lease renewal. Short, so
+	// that a renewal that hit a hung member is retried on another one well
+	// within the TTL. A variable so that tests can shorten it.
+	leaseRenewRetryInterval = 250 * time.Millisecond
+)
 
 var (
-	// errLeaseLost means the lease is no longer kept alive: etcd reported it
-	// gone, or no keepalive answer arrived within the TTL.
+	// errLeaseLost means etcd reported the lease gone (expired or revoked).
 	errLeaseLost = errors.New("lease lost")
 	// errLeadershipLost means this node held the trigger key and no longer
 	// does.
@@ -121,15 +128,13 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// buildEtcdTLS returns the TLS configuration for the etcd client, or nil if
-// no CA certificate and no client certificate is set. Without one, the etcd
-// client still uses TLS for https:// endpoints and verifies them with the
-// system CA certificates.
+// buildEtcdTLS returns the TLS configuration for the etcd client. It is never
+// nil, as in vip-manager: the etcd client uses a TLS configuration it is
+// given for every endpoint scheme but http://, including endpoints without a
+// scheme, so a nil one would make vip-elector talk plaintext where
+// vip-manager talks TLS. Without a CA file the system CA certificates verify
+// the server.
 func buildEtcdTLS(s etcdSettings) (*tls.Config, error) {
-	if s.CAFile == "" && s.CertFile == "" {
-		return nil, nil
-	}
-
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 
 	if s.CAFile != "" {
@@ -155,16 +160,21 @@ func buildEtcdTLS(s etcdSettings) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-// plaintextEndpoints returns the endpoints with an http:// scheme. The etcd
-// client connects to them without TLS even when a TLS configuration is set.
-func plaintextEndpoints(endpoints []string) []string {
-	var plain []string
-	for _, ep := range endpoints {
-		if u, err := url.Parse(ep); err == nil && u.Scheme == "http" {
-			plain = append(plain, ep)
-		}
+// isPlaintextEndpoint reports whether the etcd client would connect to the
+// endpoint without TLS although a TLS configuration is set: only for an
+// http:// endpoint. It parses the endpoint the way the etcd client does.
+func isPlaintextEndpoint(ep string) bool {
+	if strings.HasPrefix(ep, "unix:") || strings.HasPrefix(ep, "unixs:") || !strings.Contains(ep, "://") {
+		return false
 	}
-	return plain
+	u, err := url.Parse(ep)
+	return err == nil && u.Scheme == "http"
+}
+
+// etcdUsesTLS reports whether the etcd client connects with TLS. It decides
+// once, from the first endpoint, for all of them.
+func etcdUsesTLS(endpoints []string) bool {
+	return len(endpoints) > 0 && !isPlaintextEndpoint(endpoints[0])
 }
 
 // etcdSettingsWarnings returns warnings about settings that are valid but
@@ -172,11 +182,23 @@ func plaintextEndpoints(endpoints []string) []string {
 func etcdSettingsWarnings(s etcdSettings, vipMgrConfig *VipManagerConfig) []string {
 	var warnings []string
 
-	if s.CAFile != "" || s.CertFile != "" {
-		if plain := plaintextEndpoints(s.Endpoints); len(plain) > 0 {
-			warnings = append(warnings, "TLS files are set, but these endpoints use http:// and are connected to without TLS "+
-				"(use https:// for them): "+strings.Join(plain, ", "))
+	useTLS := etcdUsesTLS(s.Endpoints)
+	for i, ep := range s.Endpoints {
+		if i > 0 && isPlaintextEndpoint(ep) == useTLS {
+			mode := "without TLS"
+			if useTLS {
+				mode = "with TLS"
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"dcs-endpoints mix http:// with other schemes, but the etcd client connects to all of them %s, "+
+					"as the first one (%s) says, so %s is connected to %s too; use the same scheme for all of them",
+				mode, s.Endpoints[0], ep, mode))
+			break
 		}
+	}
+
+	if !useTLS && (s.CAFile != "" || s.CertFile != "") {
+		warnings = append(warnings, "TLS files are set, but dcs-endpoints use http://, so the etcd client connects without TLS; use https://")
 	}
 
 	if s.User == "" && s.CertFile == "" && (vipMgrConfig.EtcdUser != "" || vipMgrConfig.EtcdCertFile != "") {
@@ -217,8 +239,9 @@ func etcdConnectHint(err error) string {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		return ""
 	}
-	return "etcd did not answer: check that dcs-endpoints are reachable and, for https://, " +
-		"the CA certificate (--etcd-ca-file, etcd-ca-file, ETCDCTL_CACERT) and the client certificate; " +
+	return "etcd did not answer: check that dcs-endpoints are reachable and, for TLS, " +
+		"the CA certificate (--etcd-ca-file, etcd-ca-file, ETCDCTL_CACERT) and the client certificate " +
+		"(an endpoint without http:// is connected to with TLS, as in vip-manager); " +
 		"set ETCD_CLIENT_DEBUG=warn to see the etcd client's connection errors"
 }
 
@@ -246,11 +269,11 @@ func createEtcdClient(s etcdSettings) (*clientv3.Client, error) {
 		return nil, err
 	}
 
-	slog.Info("etcd client", "endpoints", s.Endpoints, "tls_config", tlsConfig != nil, "user", s.User)
+	slog.Info("etcd client", "endpoints", s.Endpoints, "tls", etcdUsesTLS(s.Endpoints), "user", s.User)
 	return client, nil
 }
 
-func runEtcd(ctx context.Context, config *Config, vipMgrConfig *VipManagerConfig, hostname string) error {
+func runEtcd(config *Config, vipMgrConfig *VipManagerConfig, hostname string) error {
 	settings, err := resolveEtcdSettings(config, vipMgrConfig, os.Getenv)
 	if err != nil {
 		return fmt.Errorf("invalid etcd settings: %w", err)
@@ -265,12 +288,17 @@ func runEtcd(ctx context.Context, config *Config, vipMgrConfig *VipManagerConfig
 	}
 	defer client.Close()
 
-	if err := verifyEtcdKeyState(ctx, client, vipMgrConfig.TriggerKey); err != nil {
+	if err := verifyEtcdKeyState(context.Background(), client, vipMgrConfig.TriggerKey); err != nil {
 		if hint := etcdConnectHint(err); hint != "" {
 			return fmt.Errorf("trigger-key pre-flight check failed: %w (hint: %s)", err, hint)
 		}
 		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
 	}
+
+	// Signals are handled from here on: before, there is nothing to clean up
+	// and the default action ends the process at once.
+	ctx, stop := shutdownContext()
+	defer stop()
 
 	e := &etcdElector{
 		kv:        client,
@@ -358,7 +386,7 @@ func (e *etcdElector) run(ctx context.Context) error {
 
 		slog.Info("Attempting to grant lease and acquire lock")
 
-		leaseID, err := e.grantLease(ctx)
+		leaseID, grantedTTL, err := e.grantLease(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -375,18 +403,7 @@ func (e *etcdElector) run(ctx context.Context) error {
 		// Reset backoff on success
 		backoff = time.Second
 
-		keepalive, err := startLeaseKeepalive(ctx, e.lease, leaseID)
-		if err != nil {
-			slog.Error("Failed to keep the lease alive", "lease_id", leaseHex(leaseID), "error", err)
-			if !e.revokeLease(leaseID) {
-				staleLeases = append(staleLeases, leaseID)
-			}
-			if !sleep(backoff) {
-				return nil
-			}
-			backoff = min(backoff*2, maxBackoff)
-			continue
-		}
+		keepalive := startLeaseKeepalive(ctx, e.lease, leaseID, grantedTTL)
 
 		err = e.campaign(ctx, leaseID, keepalive.lost)
 
@@ -429,19 +446,20 @@ func (e *etcdElector) run(ctx context.Context) error {
 	}
 }
 
-func (e *etcdElector) grantLease(ctx context.Context) (clientv3.LeaseID, error) {
+// grantLease grants a lease and returns it with the TTL etcd granted.
+func (e *etcdElector) grantLease(ctx context.Context) (clientv3.LeaseID, time.Duration, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, etcdRequestTimeout)
 	defer cancel()
 	resp, err := e.lease.Grant(reqCtx, e.ttl)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	slog.Info("Lease granted", "lease_id", leaseHex(resp.ID), "ttl", time.Duration(resp.TTL)*time.Second)
 	if resp.TTL != e.ttl {
 		// etcd raises a TTL below its minimum (2s with default settings).
 		slog.Warn("etcd changed the lease TTL", "requested", time.Duration(e.ttl)*time.Second, "granted", time.Duration(resp.TTL)*time.Second)
 	}
-	return resp.ID, nil
+	return resp.ID, time.Duration(resp.TTL) * time.Second, nil
 }
 
 // campaign waits until the trigger key is free, takes it with the lease and
@@ -458,8 +476,10 @@ func (e *etcdElector) campaign(ctx context.Context, leaseID clientv3.LeaseID, le
 
 		switch {
 		case st.exists && st.lease == leaseID:
-			// Our own write, e.g. a transaction that timed out on the
-			// client after etcd applied it.
+			// Our own write. Not expected today (a failed transaction ends
+			// the attempt, which revokes the lease), but if it happens this
+			// node must hold the key as leader, not wait on it as a standby
+			// while vip-manager gives it the VIP.
 		case st.exists && st.lease == 0:
 			return &plainKeyError{key: e.key}
 		case st.exists:
@@ -477,13 +497,14 @@ func (e *etcdElector) campaign(ctx context.Context, leaseID clientv3.LeaseID, le
 		default:
 			if e.lockDelay > 0 {
 				slog.Info("Trigger key is free, waiting lock-delay before taking it", "lock_delay", e.lockDelay)
-				select {
-				case <-time.After(e.lockDelay):
-				case <-ctx.Done():
-					slog.Info("Lock acquisition cancelled")
-					return nil
-				case <-leaseLost:
-					return errLeaseLost
+				quiet, err := e.waitUnchanged(ctx, rev, e.lockDelay, leaseLost)
+				if err != nil {
+					return e.cancelled(ctx, err)
+				}
+				if !quiet {
+					// Another node took the key (and maybe already let it
+					// go) during the wait: lock-delay counts from then.
+					continue
 				}
 			}
 			acquired, txnRev, err := e.tryAcquire(ctx, leaseID)
@@ -608,6 +629,44 @@ func (e *etcdElector) waitForKey(ctx context.Context, rev int64, leaseLost <-cha
 	}
 }
 
+// waitUnchanged returns true once the trigger key has not changed for d after
+// rev, and false as soon as it changes or the watch ends (the caller reads
+// the key again and starts over). A node that waits lock-delay must not take
+// the key if another node held it meanwhile: the delay has to count from
+// that node's release, or it could be cut short to almost nothing.
+func (e *etcdElector) waitUnchanged(ctx context.Context, rev int64, d time.Duration, leaseLost <-chan struct{}) (bool, error) {
+	watchCtx, cancel := context.WithCancel(clientv3.WithRequireLeader(ctx))
+	defer cancel()
+	watchCh := e.watcher.Watch(watchCtx, e.key, clientv3.WithRev(rev+1))
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return true, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-leaseLost:
+			return false, errLeaseLost
+		case resp, ok := <-watchCh:
+			switch {
+			case !ok:
+				if ctx.Err() != nil {
+					return false, ctx.Err()
+				}
+				return false, nil
+			case resp.Err() != nil:
+				slog.Warn("Watch on the trigger key ended, reading the key again", "error", resp.Err())
+				return false, nil
+			case len(resp.Events) > 0:
+				return false, nil
+			}
+		}
+	}
+}
+
 // watchKey watches the trigger key from rev+1. It returns true when done
 // reports true for an event, and false when the watch ended without one.
 func (e *etcdElector) watchKey(ctx context.Context, rev int64, leaseLost <-chan struct{}, done func(keyState) bool) (bool, error) {
@@ -681,23 +740,16 @@ func (e *etcdElector) revokeLease(id clientv3.LeaseID) bool {
 	}
 }
 
-// leaseKeepalive keeps a lease alive in the background.
+// leaseKeepalive renews a lease in the background.
 type leaseKeepalive struct {
 	cancel context.CancelFunc
-	// lost is closed when the lease is no longer kept alive: etcd reported
-	// it gone, or the etcd client got no answer within the TTL.
+	// lost is closed when etcd reports the lease gone.
 	lost chan struct{}
 	done chan struct{}
 }
 
-func startLeaseKeepalive(parent context.Context, lease clientv3.Lease, id clientv3.LeaseID) (*leaseKeepalive, error) {
+func startLeaseKeepalive(parent context.Context, lease clientv3.Lease, id clientv3.LeaseID, ttl time.Duration) *leaseKeepalive {
 	ctx, cancel := context.WithCancel(parent)
-	respCh, err := lease.KeepAlive(ctx, id)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
 	k := &leaseKeepalive{
 		cancel: cancel,
 		lost:   make(chan struct{}),
@@ -706,19 +758,74 @@ func startLeaseKeepalive(parent context.Context, lease clientv3.Lease, id client
 
 	go func() {
 		defer close(k.done)
-		// The responses must be read, or the etcd client drops them and
-		// logs a warning for each.
-		for range respCh {
-		}
-		// The etcd client closes the channel when ctx ends, when etcd
-		// reports the lease gone, and when no answer came within the TTL.
-		if ctx.Err() == nil {
-			slog.Warn("Lease is no longer kept alive", "lease_id", leaseHex(id))
+		if err := renewLease(ctx, lease, id, ttl); err != nil {
+			slog.Warn("Lease is no longer valid", "lease_id", leaseHex(id), "error", err)
 			close(k.lost)
 		}
 	}()
 
-	return k, nil
+	return k
+}
+
+// renewLease renews the lease every TTL/3 until ctx is cancelled. It returns
+// errLeaseLost once etcd reports the lease gone, and nil when ctx is
+// cancelled.
+//
+// It does not use the etcd client's KeepAlive stream. That stream stays on
+// one etcd member, and the client moves it only when gRPC keepalive declares
+// the connection dead, which takes at least 15s (gRPC pings no more often
+// than every 10s). If that member hangs, the other members let the lease
+// expire meanwhile, while the cluster is healthy. Each KeepAliveOnce opens a
+// new stream, which the client's balancer places on the next member, and a
+// deadline of half the interval bounds each call, so a renewal that hit a
+// hung member is retried on another one well within the TTL.
+//
+// Other errors are retried for as long as etcd does not answer: leadership
+// is not given up while etcd is unreachable, as with Consul. etcd keeps
+// leases through a loss of quorum or a restart, and a lease that expired
+// meanwhile is reported as not found once etcd answers again (its key is
+// deleted with it, which the watch reports too). The KeepAlive stream gives
+// up after one TTL without an answer instead, and revoking then would delete
+// a key that etcd kept.
+func renewLease(ctx context.Context, lease clientv3.Lease, id clientv3.LeaseID, ttl time.Duration) error {
+	if ttl <= 0 {
+		// validateConfig rejects this; never spin if it gets here anyway.
+		<-ctx.Done()
+		return nil
+	}
+
+	interval := ttl / 3
+	wait := interval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, interval/2)
+		resp, err := lease.KeepAliveOnce(reqCtx, id)
+		cancel()
+
+		if ctx.Err() != nil {
+			return nil
+		}
+		if errors.Is(err, rpctypes.ErrLeaseNotFound) {
+			return errLeaseLost
+		}
+		if err != nil {
+			slog.Warn("Failed to renew lease, retrying", "lease_id", leaseHex(id), "error", err)
+			wait = min(leaseRenewRetryInterval, interval)
+			continue
+		}
+
+		// etcd may have raised the TTL (to its minimum).
+		if resp.TTL > 0 {
+			interval = time.Duration(resp.TTL) * time.Second / 3
+		}
+		wait = interval
+	}
 }
 
 // stop ends the keepalive and waits for its goroutine to exit.

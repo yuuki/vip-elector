@@ -187,10 +187,15 @@ func TestBuildEtcdTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("no files gives no TLS configuration", func(t *testing.T) {
+	t.Run("no files still gives a TLS configuration, as in vip-manager", func(t *testing.T) {
+		// A nil one would make endpoints without a scheme plaintext, where
+		// vip-manager uses TLS.
 		cfg, err := buildEtcdTLS(etcdSettings{})
-		if err != nil || cfg != nil {
-			t.Fatalf("expected nil, nil; got %v, %v", cfg, err)
+		if err != nil || cfg == nil {
+			t.Fatalf("expected a TLS configuration, got %v, %v", cfg, err)
+		}
+		if cfg.RootCAs != nil || len(cfg.Certificates) != 0 {
+			t.Error("expected the system CAs and no client certificate")
 		}
 	})
 
@@ -250,16 +255,27 @@ func TestEtcdSettingsWarnings(t *testing.T) {
 	}{
 		{
 			name: "plain http without TLS files",
-			s:    etcdSettings{Endpoints: []string{"http://a:2379"}},
+			s:    etcdSettings{Endpoints: []string{"http://a:2379", "http://b:2379"}},
 		},
 		{
-			name: "https with a CA file",
+			name: "https and no scheme with a CA file all use TLS",
 			s:    etcdSettings{Endpoints: []string{"https://a:2379", "b:2379"}, CAFile: "/ca.pem"},
 		},
 		{
-			name: "http with a CA file is not encrypted",
-			s:    etcdSettings{Endpoints: []string{"https://a:2379", "HTTP://b:2379"}, CAFile: "/ca.pem"},
-			want: []string{"HTTP://b:2379"},
+			// The first endpoint decides for all of them.
+			name: "http after https is connected to with TLS",
+			s:    etcdSettings{Endpoints: []string{"https://a:2379", "HTTP://b:2379"}},
+			want: []string{"so HTTP://b:2379 is connected to with TLS"},
+		},
+		{
+			name: "https after http is connected to without TLS",
+			s:    etcdSettings{Endpoints: []string{"http://a:2379", "https://b:2379"}, CAFile: "/ca.pem"},
+			want: []string{"so https://b:2379 is connected to without TLS", "TLS files are set"},
+		},
+		{
+			name: "http with a client certificate is not encrypted",
+			s:    etcdSettings{Endpoints: []string{"http://a:2379"}, CertFile: "/c.pem", KeyFile: "/k.pem"},
+			want: []string{"TLS files are set"},
 		},
 		{
 			name: "vip-manager credentials without our own",
@@ -286,6 +302,29 @@ func TestEtcdSettingsWarnings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEtcdUsesTLS(t *testing.T) {
+	tests := []struct {
+		endpoints []string
+		want      bool
+	}{
+		{[]string{"http://a:2379"}, false},
+		{[]string{"HTTP://a:2379"}, false},
+		{[]string{"https://a:2379"}, true},
+		// No scheme: TLS, because a TLS configuration is always set.
+		{[]string{"a:2379"}, true},
+		{[]string{"unix:///run/etcd.sock"}, true},
+		{[]string{"unixs:///run/etcd.sock"}, true},
+		{[]string{"http://a:2379", "https://b:2379"}, false},
+		{[]string{"https://a:2379", "http://b:2379"}, true},
+		{nil, false},
+	}
+	for _, tt := range tests {
+		if got := etcdUsesTLS(tt.endpoints); got != tt.want {
+			t.Errorf("etcdUsesTLS(%q) = %v, want %v", tt.endpoints, got, tt.want)
+		}
 	}
 }
 

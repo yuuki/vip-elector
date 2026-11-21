@@ -202,7 +202,7 @@ func verifyLockKeyState(kv kvGetter, key string) error {
 }
 
 // runConsul runs the election on Consul until ctx is cancelled.
-func runConsul(ctx context.Context, config *Config, vipMgrConfig *VipManagerConfig, hostname string) error {
+func runConsul(config *Config, vipMgrConfig *VipManagerConfig, hostname string) error {
 	// Initialize Consul client
 	consulClient, err := createConsulClient(config, vipMgrConfig)
 	if err != nil {
@@ -225,6 +225,10 @@ func runConsul(ctx context.Context, config *Config, vipMgrConfig *VipManagerConf
 	if err := verifyLockKeyState(consulClient.KV(), vipMgrConfig.TriggerKey); err != nil {
 		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
 	}
+
+	// Setup signal handling (only now, see shutdownContext)
+	ctx, stop := shutdownContext()
+	defer stop()
 
 	// Main election loop
 	return runElectionLoop(ctx, consulClient, vipMgrConfig, config, hostname)

@@ -171,26 +171,41 @@ func deleteEvent() clientv3.WatchResponse {
 	return clientv3.WatchResponse{Events: []*clientv3.Event{{Type: mvccpb.DELETE, Kv: &mvccpb.KeyValue{Key: []byte(testEtcdKey)}}}}
 }
 
-// fakeLease grants consecutive lease IDs, keeps a keepalive channel per
-// lease for the test to close, and records calls in order.
+// fakeLease grants consecutive lease IDs, answers renewals, and records
+// grants and revokes in order.
 type fakeLease struct {
 	clientv3.Lease
-	mu           sync.Mutex
-	calls        []string
-	nextID       clientv3.LeaseID
-	grantTTL     int64 // TTL to grant; 0 grants the requested one
-	grantErr     error
-	keepAliveErr error
-	revokeErrs   []error // answers to Revoke calls in order; nil after that
-	keepalives   map[clientv3.LeaseID]*fakeKeepalive
+	mu         sync.Mutex
+	calls      []string
+	nextID     clientv3.LeaseID
+	grantTTL   int64 // TTL to grant; 0 grants the requested one
+	grantErr   error
+	revokeErrs []error // answers to Revoke calls in order; nil after that
+	// renew answers the n-th KeepAliveOnce call (n starts at 0); nil
+	// renews successfully unless the lease is gone.
+	renew func(ctx context.Context, n int) (*clientv3.LeaseKeepAliveResponse, error)
+	// gone holds leases etcd reports as not found.
+	gone          map[clientv3.LeaseID]bool
+	renews        int
+	renewTimes    []time.Time
+	renewDeadline []time.Duration // time left until each call's deadline
 }
 
-type fakeKeepalive struct {
-	ch   chan *clientv3.LeaseKeepAliveResponse
-	once sync.Once
+// markGone makes renewals of the lease report it as not found.
+func (l *fakeLease) markGone(id clientv3.LeaseID) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.gone == nil {
+		l.gone = map[clientv3.LeaseID]bool{}
+	}
+	l.gone[id] = true
 }
 
-func (k *fakeKeepalive) close() { k.once.Do(func() { close(k.ch) }) }
+func (l *fakeLease) renewCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.renews
+}
 
 func (l *fakeLease) record(format string, args ...any) {
 	l.calls = append(l.calls, fmt.Sprintf(format, args...))
@@ -212,24 +227,27 @@ func (l *fakeLease) Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantR
 	return &clientv3.LeaseGrantResponse{ID: l.nextID, TTL: granted}, nil
 }
 
-func (l *fakeLease) KeepAlive(ctx context.Context, id clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error) {
+func (l *fakeLease) KeepAliveOnce(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseKeepAliveResponse, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.keepAliveErr != nil {
-		return nil, l.keepAliveErr
+	n := l.renews
+	l.renews++
+	l.renewTimes = append(l.renewTimes, time.Now())
+	left := time.Duration(-1)
+	if deadline, ok := ctx.Deadline(); ok {
+		left = time.Until(deadline)
 	}
-	l.record("keepalive %d", id)
-	k := &fakeKeepalive{ch: make(chan *clientv3.LeaseKeepAliveResponse)}
-	if l.keepalives == nil {
-		l.keepalives = map[clientv3.LeaseID]*fakeKeepalive{}
+	l.renewDeadline = append(l.renewDeadline, left)
+	gone, renew := l.gone[id], l.renew
+	l.mu.Unlock()
+
+	switch {
+	case gone:
+		return nil, rpctypes.ErrLeaseNotFound
+	case renew != nil:
+		return renew(ctx, n)
+	default:
+		return &clientv3.LeaseKeepAliveResponse{ID: id, TTL: 10}, nil
 	}
-	l.keepalives[id] = k
-	// Like the etcd client, close the channel when ctx ends.
-	go func() {
-		<-ctx.Done()
-		k.close()
-	}()
-	return k.ch, nil
 }
 
 func (l *fakeLease) Revoke(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
@@ -251,24 +269,6 @@ func (l *fakeLease) callLog() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return slices.Clone(l.calls)
-}
-
-// keepalive returns the keepalive of the lease once it has started.
-func (l *fakeLease) keepalive(t *testing.T, id clientv3.LeaseID) *fakeKeepalive {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		l.mu.Lock()
-		k := l.keepalives[id]
-		l.mu.Unlock()
-		if k != nil {
-			return k
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no keepalive for lease %d", id)
-		}
-		time.Sleep(time.Millisecond)
-	}
 }
 
 // waitForCall waits until the call log contains the call.
@@ -524,19 +524,116 @@ func TestHoldLock(t *testing.T) {
 	})
 }
 
-func TestLeaseKeepalive_SignalsLostLease(t *testing.T) {
+// shortRenewRetry makes failed renewals retry at once.
+func shortRenewRetry(t *testing.T) {
+	old := leaseRenewRetryInterval
+	leaseRenewRetryInterval = time.Millisecond
+	t.Cleanup(func() { leaseRenewRetryInterval = old })
+}
+
+func TestRenewLease_ReturnsLostWhenLeaseGone(t *testing.T) {
 	l := &fakeLease{}
+	l.markGone(1)
 	ctx, _ := cancelableContext(t)
 
-	k, err := startLeaseKeepalive(ctx, l, 1)
-	if err != nil {
-		t.Fatal(err)
+	res := result(func() error { return renewLease(ctx, l, 1, 30*time.Millisecond) })
+	if err := expectResult(t, res); !errors.Is(err, errLeaseLost) {
+		t.Errorf("expected errLeaseLost, got %v", err)
 	}
-	defer k.stop()
+}
 
-	// The etcd client closes the channel when the lease is gone or no
-	// answer came within the TTL.
-	l.keepalive(t, 1).close()
+func TestRenewLease_RetriesWhileEtcdDoesNotAnswer(t *testing.T) {
+	// Leadership is not given up while etcd is unreachable, however long:
+	// etcd keeps leases through an outage.
+	shortRenewRetry(t)
+	l := &fakeLease{renew: func(ctx context.Context, n int) (*clientv3.LeaseKeepAliveResponse, error) {
+		return nil, errors.New("etcdserver: request timed out")
+	}}
+	ctx, cancel := cancelableContext(t)
+
+	res := result(func() error { return renewLease(ctx, l, 1, 30*time.Millisecond) })
+	deadline := time.Now().Add(5 * time.Second)
+	for l.renewCount() < 20 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected renewals to be retried, got %d", l.renewCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	expectBlocked(t, res)
+	cancel()
+	if err := expectResult(t, res); err != nil {
+		t.Errorf("expected nil on shutdown, got %v", err)
+	}
+}
+
+func TestRenewLease_MovesOnFromHungCall(t *testing.T) {
+	// A renewal that reaches a hung member must not block the next one
+	// past the TTL: each call has a deadline of half the interval.
+	shortRenewRetry(t)
+	const ttl = 300 * time.Millisecond
+	l := &fakeLease{renew: func(ctx context.Context, n int) (*clientv3.LeaseKeepAliveResponse, error) {
+		if n == 0 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return &clientv3.LeaseKeepAliveResponse{TTL: 0}, nil
+	}}
+	ctx, cancel := cancelableContext(t)
+
+	res := result(func() error { return renewLease(ctx, l, 1, ttl) })
+	deadline := time.Now().Add(5 * time.Second)
+	for l.renewCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("expected a second renewal")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := expectResult(t, res); err != nil {
+		t.Errorf("expected nil on shutdown, got %v", err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	interval := ttl / 3
+	if left := l.renewDeadline[0]; left <= 0 || left > interval/2 {
+		t.Errorf("expected each renewal to carry a deadline of at most %v, got %v", interval/2, left)
+	}
+	// First renewal after interval, hung for interval/2, retried at once.
+	if second := l.renewTimes[1].Sub(l.renewTimes[0]); second > interval {
+		t.Errorf("expected the retry within %v of the hung renewal, it came after %v", interval, second)
+	}
+}
+
+func TestRenewLease_StopsOnContextCancel(t *testing.T) {
+	ctx, cancel := cancelableContext(t)
+	res := result(func() error { return renewLease(ctx, &fakeLease{}, 1, 30*time.Millisecond) })
+	expectBlocked(t, res)
+	cancel()
+	if err := expectResult(t, res); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+func TestRenewLease_ZeroTTLDoesNotSpin(t *testing.T) {
+	l := &fakeLease{}
+	ctx, cancel := cancelableContext(t)
+	res := result(func() error { return renewLease(ctx, l, 1, 0) })
+	expectBlocked(t, res)
+	cancel()
+	expectResult(t, res)
+	if l.renewCount() != 0 {
+		t.Errorf("expected no renewals, got %d", l.renewCount())
+	}
+}
+
+func TestLeaseKeepalive_SignalsLostLease(t *testing.T) {
+	l := &fakeLease{}
+	l.markGone(1)
+	ctx, _ := cancelableContext(t)
+
+	k := startLeaseKeepalive(ctx, l, 1, 30*time.Millisecond)
+	defer k.stop()
 
 	select {
 	case <-k.lost:
@@ -547,10 +644,7 @@ func TestLeaseKeepalive_SignalsLostLease(t *testing.T) {
 
 func TestLeaseKeepalive_StopDoesNotSignalLost(t *testing.T) {
 	ctx, _ := cancelableContext(t)
-	k, err := startLeaseKeepalive(ctx, &fakeLease{}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	k := startLeaseKeepalive(ctx, &fakeLease{}, 1, 30*time.Millisecond)
 	k.stop()
 
 	select {
@@ -562,10 +656,7 @@ func TestLeaseKeepalive_StopDoesNotSignalLost(t *testing.T) {
 
 func TestLeaseKeepalive_ParentCancelDoesNotSignalLost(t *testing.T) {
 	ctx, cancel := cancelableContext(t)
-	k, err := startLeaseKeepalive(ctx, &fakeLease{}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	k := startLeaseKeepalive(ctx, &fakeLease{}, 1, 30*time.Millisecond)
 	cancel()
 
 	select {
@@ -577,13 +668,6 @@ func TestLeaseKeepalive_ParentCancelDoesNotSignalLost(t *testing.T) {
 	case <-k.lost:
 		t.Error("shutdown must not signal a lost lease")
 	default:
-	}
-}
-
-func TestLeaseKeepalive_StartError(t *testing.T) {
-	ctx, _ := cancelableContext(t)
-	if _, err := startLeaseKeepalive(ctx, &fakeLease{keepAliveErr: errors.New("halted")}, 1); err == nil {
-		t.Error("expected an error")
 	}
 }
 
@@ -606,7 +690,8 @@ func TestCampaign_PlainKey(t *testing.T) {
 }
 
 func TestCampaign_KeyAlreadyHeldByOwnLease(t *testing.T) {
-	// E.g. a transaction that timed out on the client after etcd applied it.
+	// Not expected today (a failed write ends the attempt and revokes the
+	// lease), but this node must then act as the holder.
 	const ours clientv3.LeaseID = 3
 	w := newFakeWatcher()
 	kv := &fakeKV{get: always(getResp(40, keyValue(ours, "node1")), nil)}
@@ -640,6 +725,10 @@ func TestCampaign_WaitsLockDelayBeforeTakingFreeKey(t *testing.T) {
 	start := time.Now()
 	res := result(func() error { return e.campaign(ctx, 1, nil) })
 
+	// During lock-delay the key is watched from the read revision.
+	if fw := w.next(t); fw.rev != 6 {
+		t.Errorf("expected the wait to watch from revision 6, got %d", fw.rev)
+	}
 	if fw := w.next(t); fw.rev != 7 {
 		t.Errorf("expected to hold the lock from the write revision 7, got %d", fw.rev)
 	}
@@ -654,6 +743,42 @@ func TestCampaign_WaitsLockDelayBeforeTakingFreeKey(t *testing.T) {
 	}
 	if kv.noDeadline != 0 {
 		t.Errorf("expected every request to carry a deadline, %d did not", kv.noDeadline)
+	}
+	cancel()
+	if err := expectResult(t, res); err != nil {
+		t.Errorf("expected nil on shutdown, got %v", err)
+	}
+}
+
+func TestCampaign_LockDelayRestartsWhenKeyChanges(t *testing.T) {
+	// Another node takes the key during our lock-delay and lets it go
+	// again: our delay must count from its release, not from when we first
+	// saw the key free.
+	const lockDelay = 100 * time.Millisecond
+	w := newFakeWatcher()
+	kv := &fakeKV{get: sequence(getResp(5), getResp(8)), txnSucceeded: true, txnRev: 9}
+	e := &etcdElector{kv: kv, watcher: w, key: testEtcdKey, value: "node1", lockDelay: lockDelay}
+	ctx, cancel := cancelableContext(t)
+
+	res := result(func() error { return e.campaign(ctx, 1, nil) })
+
+	first := w.next(t)
+	time.Sleep(lockDelay / 2)
+	changedAt := time.Now()
+	first.ch <- clientv3.WatchResponse{Events: []*clientv3.Event{
+		{Type: mvccpb.PUT, Kv: keyValue(7, "nodeC")},
+		{Type: mvccpb.DELETE, Kv: &mvccpb.KeyValue{Key: []byte(testEtcdKey)}},
+	}}
+
+	if fw := w.next(t); fw.rev != 9 {
+		t.Errorf("expected the new wait to watch from the re-read revision 9, got %d", fw.rev)
+	}
+	w.next(t) // holding the lock
+	if kv.txnCount() != 1 {
+		t.Fatalf("expected one write, got %d", kv.txnCount())
+	}
+	if waited := kv.txnTimes[0].Sub(changedAt); waited < lockDelay {
+		t.Errorf("expected the write lock-delay (%s) after the key changed, it came after %s", lockDelay, waited)
 	}
 	cancel()
 	if err := expectResult(t, res); err != nil {
@@ -754,7 +879,7 @@ func TestEtcdRun_RevokesLeaseOnShutdown(t *testing.T) {
 		t.Errorf("expected nil on shutdown, got %v", err)
 	}
 	// Revoking the lease is what deletes the key.
-	want := []string{"grant 1", "keepalive 1", "revoke 1"}
+	want := []string{"grant 1", "revoke 1"}
 	if got := l.callLog(); !slices.Equal(got, want) {
 		t.Errorf("expected calls %v, got %v", want, got)
 	}
@@ -765,12 +890,15 @@ func TestEtcdRun_RetriesStaleLeaseBeforeNextAttempt(t *testing.T) {
 	kv := &fakeKV{get: always(getResp(5), nil), txnSucceeded: true, txnRev: 6}
 	l := &fakeLease{revokeErrs: []error{errors.New("etcd unreachable")}}
 	ctx, cancel := cancelableContext(t)
+	e := newRunElector(kv, l, w)
+	e.ttl = 1 // renewals every 333ms
 
-	res := result(func() error { return newRunElector(kv, l, w).run(ctx) })
+	res := result(func() error { return e.run(ctx) })
 	w.next(t) // holding the lock with lease 1
 
-	// The lease is lost and cannot be revoked; it may still hold the key.
-	l.keepalive(t, 1).close()
+	// etcd reports the lease gone, and the revoke fails; as far as this
+	// node knows, the lease may still hold the key.
+	l.markGone(1)
 	l.waitForCall(t, "grant 2")
 	cancel()
 	if err := expectResult(t, res); err != nil {
@@ -778,7 +906,7 @@ func TestEtcdRun_RetriesStaleLeaseBeforeNextAttempt(t *testing.T) {
 	}
 
 	got := l.callLog()
-	want := []string{"grant 1", "keepalive 1", "revoke 1 failed", "revoke 1", "grant 2"}
+	want := []string{"grant 1", "revoke 1 failed", "revoke 1", "grant 2"}
 	if len(got) < len(want) || !slices.Equal(got[:len(want)], want) {
 		t.Errorf("expected calls to start with %v, got %v", want, got)
 	}

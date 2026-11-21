@@ -174,6 +174,19 @@ func runEtcdElectorToExit(t *testing.T, args ...string) string {
 	return string(output)
 }
 
+// getEtcdRevision returns etcd's current revision.
+func getEtcdRevision(t *testing.T, client *clientv3.Client) int64 {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := client.Get(ctx, etcdTriggerKey)
+	if err != nil {
+		t.Fatalf("Failed to read the revision: %v", err)
+	}
+	return resp.Header.Revision
+}
+
 func getEtcdKey(t *testing.T, client *clientv3.Client) *mvccpb.KeyValue {
 	t.Helper()
 
@@ -304,10 +317,11 @@ func TestEtcdGracefulFailoverWaitsLockDelay(t *testing.T) {
 	node2 := startEtcdElector(t, config, "--hostname=node2", "--lock-delay=1s")
 	node2.waitForLog(t, "Lock is held by another node, waiting", 10*time.Second)
 
-	// Record when the key is deleted and when it is written again.
+	// Record when the key is deleted and when it is written again, from
+	// node1's write on, so that no event can be missed.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	watch := client.Watch(ctx, etcdTriggerKey)
+	watch := client.Watch(ctx, etcdTriggerKey, clientv3.WithRev(getEtcdKey(t, client).ModRevision+1))
 
 	node1.stop(t, os.Interrupt)
 
@@ -336,6 +350,60 @@ func TestEtcdGracefulFailoverWaitsLockDelay(t *testing.T) {
 			}
 		case <-timeout:
 			t.Fatalf("Timeout waiting for failover (deleted at %v)", deletedAt)
+		}
+	}
+}
+
+// TestEtcdLockDelayCountsFromLastRelease verifies that a node waiting
+// lock-delay on a free key starts its wait over when another holder takes
+// the key and lets it go meanwhile. Otherwise the delay after that release
+// could be cut short to almost nothing.
+func TestEtcdLockDelayCountsFromLastRelease(t *testing.T) {
+	client := setupEtcdClient(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	watch := client.Watch(ctx, etcdTriggerKey, clientv3.WithRev(getEtcdRevision(t, client)+1))
+
+	node := startEtcdElector(t, writeEtcdConfig(t, ""), "--hostname=node1", "--lock-delay=2s")
+	node.waitForLog(t, "Trigger key is free, waiting lock-delay", 10*time.Second)
+
+	// Another holder takes the key 1s into the wait and lets it go 0.3s later.
+	time.Sleep(time.Second)
+	lease, err := client.Grant(ctx, 10)
+	if err != nil {
+		t.Fatalf("Failed to grant lease: %v", err)
+	}
+	if _, err := client.Put(ctx, etcdTriggerKey, "other", clientv3.WithLease(lease.ID)); err != nil {
+		t.Fatalf("Failed to write the key: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := client.Revoke(ctx, lease.ID); err != nil {
+		t.Fatalf("Failed to revoke lease: %v", err)
+	}
+
+	var releasedAt time.Time
+	for {
+		select {
+		case resp := <-watch:
+			for _, ev := range resp.Events {
+				switch {
+				case ev.Type == mvccpb.DELETE:
+					releasedAt = time.Now()
+				case string(ev.Kv.Value) == "node1":
+					if releasedAt.IsZero() {
+						t.Fatal("node1 wrote the key before the other holder released it")
+					}
+					gap := time.Since(releasedAt)
+					t.Logf("node1 took the key %v after the other holder released it", gap)
+					if gap < 1900*time.Millisecond {
+						t.Errorf("Expected node1 to wait lock-delay (2s) after the release, it waited %v", gap)
+					}
+					return
+				}
+			}
+		case <-ctx.Done():
+			t.Fatal("Timeout waiting for node1 to take the key")
 		}
 	}
 }
