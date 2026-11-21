@@ -201,6 +201,35 @@ func verifyLockKeyState(kv kvGetter, key string) error {
 	return nil
 }
 
+// runConsul runs the election on Consul until ctx is cancelled.
+func runConsul(ctx context.Context, config *Config, vipMgrConfig *VipManagerConfig, hostname string) error {
+	// Initialize Consul client
+	consulClient, err := createConsulClient(config, vipMgrConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create Consul client: %w", err)
+	}
+
+	// Look up the check (if specified). This only warns; see checkWarning.
+	if config.CheckID != "" {
+		st, err := lookupAgentCheck(consulClient.Agent(), config.CheckID)
+		if msg := checkWarning(st, err); msg != "" {
+			if err != nil {
+				slog.Warn(msg, "check_id", config.CheckID, "error", err)
+			} else {
+				slog.Warn(msg, "check_id", config.CheckID)
+			}
+		}
+	}
+
+	// Verify trigger-key state before attempting lock acquisition
+	if err := verifyLockKeyState(consulClient.KV(), vipMgrConfig.TriggerKey); err != nil {
+		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
+	}
+
+	// Main election loop
+	return runElectionLoop(ctx, consulClient, vipMgrConfig, config, hostname)
+}
+
 func runElectionLoop(ctx context.Context, client *api.Client, vipMgrConfig *VipManagerConfig, config *Config, hostname string) error {
 	backoff := time.Second
 	maxBackoff := 30 * time.Second

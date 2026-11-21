@@ -38,6 +38,13 @@ type VipManagerConfig struct {
 	// TriggerValue is the value vip-manager compares the trigger key with.
 	// vip-manager defaults it to os.Hostname() when it is not set.
 	TriggerValue yamlString `yaml:"trigger-value"`
+	// EtcdCAFile verifies the etcd server certificate; vip-elector uses it
+	// too (see resolveEtcdSettings).
+	EtcdCAFile yamlString `yaml:"etcd-ca-file"`
+	// vip-manager's etcd credentials are read only to warn that vip-elector
+	// does not use them (see etcdSettingsWarnings).
+	EtcdUser     string `yaml:"etcd-user"`
+	EtcdCertFile string `yaml:"etcd-cert-file"`
 }
 
 // yamlString is a YAML scalar that must be written as a string (or left
@@ -71,7 +78,30 @@ type Config struct {
 	ConsulAddr           string
 	ConsulToken          string
 	Hostname             string
+	EtcdUser             string
+	EtcdPassword         string
+	EtcdCAFile           string
+	EtcdCertFile         string
+	EtcdKeyFile          string
+	// setFlags holds the names of the flags given on the command line.
+	setFlags map[string]bool
 }
+
+const dcsTypeConsul = "consul"
+
+// isEtcd reports whether the dcs-type selects etcd. vip-manager accepts both
+// names.
+func isEtcd(dcsType string) bool {
+	return dcsType == "etcd" || dcsType == "etcd3"
+}
+
+// Flags that only apply to one DCS. With the other DCS they are rejected
+// rather than ignored: an ignored --check-id would leave a node that is
+// believed to fail over on health but does not.
+var (
+	consulOnlyFlags = []string{"check-id", "addr", "token"}
+	etcdOnlyFlags   = []string{"etcd-user", "etcd-password", "etcd-ca-file", "etcd-cert-file", "etcd-key-file"}
+)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -96,18 +126,16 @@ func run() error {
 		return fmt.Errorf("failed to load vip-manager config: %w", err)
 	}
 
-	// Validate DCS type
-	if vipMgrConfig.DCSType != "consul" {
-		return fmt.Errorf("unsupported dcs-type: %s (only 'consul' is supported)", vipMgrConfig.DCSType)
+	// Validate DCS type and the flags that only apply to one DCS
+	if err := validateDCSConfig(vipMgrConfig.DCSType, config); err != nil {
+		return err
 	}
 
 	// Log startup configuration
-	logStartupConfig(config, vipMgrConfig)
-
-	// Initialize Consul client
-	consulClient, err := createConsulClient(config, vipMgrConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create Consul client: %w", err)
+	if vipMgrConfig.DCSType == dcsTypeConsul {
+		logStartupConfig(config, vipMgrConfig)
+	} else {
+		logEtcdStartupConfig(config, vipMgrConfig)
 	}
 
 	// The value written to the trigger key. It must equal vip-manager's
@@ -121,23 +149,6 @@ func run() error {
 	slog.Info("Using hostname", "hostname", hostname, "source", source)
 	if source == lockValueSourceFlag {
 		warnIfFlagDiffersFromVipManager(hostname, triggerValue, os.Hostname)
-	}
-
-	// Look up the check (if specified). This only warns; see checkWarning.
-	if config.CheckID != "" {
-		st, err := lookupAgentCheck(consulClient.Agent(), config.CheckID)
-		if msg := checkWarning(st, err); msg != "" {
-			if err != nil {
-				slog.Warn(msg, "check_id", config.CheckID, "error", err)
-			} else {
-				slog.Warn(msg, "check_id", config.CheckID)
-			}
-		}
-	}
-
-	// Verify trigger-key state before attempting lock acquisition
-	if err := verifyLockKeyState(consulClient.KV(), vipMgrConfig.TriggerKey); err != nil {
-		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
 	}
 
 	// Setup signal handling
@@ -154,8 +165,10 @@ func run() error {
 		cancel()
 	}()
 
-	// Main election loop
-	return runElectionLoop(ctx, consulClient, vipMgrConfig, config, hostname)
+	if vipMgrConfig.DCSType == dcsTypeConsul {
+		return runConsul(ctx, config, vipMgrConfig, hostname)
+	}
+	return runEtcd(ctx, config, vipMgrConfig, hostname)
 }
 
 func parseFlags() (*Config, error) {
@@ -163,14 +176,22 @@ func parseFlags() (*Config, error) {
 
 	versionFlag := flag.Bool("version", false, "Show version information")
 	flag.StringVar(&config.VipManagerConfigPath, "vip-manager-config", "", "Path to vip-manager.yml (required)")
-	flag.StringVar(&config.CheckID, "check-id", "", "Consul service check ID to associate with session")
-	ttlStr := flag.String("ttl", defaultTTL, "Session TTL (e.g., 10s, 15s)")
-	lockDelayStr := flag.String("lock-delay", defaultLockDelay, "Time other nodes must wait after the leader's session ends before acquiring the lock (e.g., 2s)")
-	flag.StringVar(&config.ConsulAddr, "addr", "", "Consul address (overrides vip-manager.yml and CONSUL_HTTP_ADDR)")
-	flag.StringVar(&config.ConsulToken, "token", "", "Consul ACL token (overrides CONSUL_HTTP_TOKEN)")
+	flag.StringVar(&config.CheckID, "check-id", "", "Consul service check ID to associate with session (consul only)")
+	ttlStr := flag.String("ttl", defaultTTL, "Session TTL (consul) or lease TTL in whole seconds (etcd) (e.g., 10s, 15s)")
+	lockDelayStr := flag.String("lock-delay", defaultLockDelay, "Time other nodes must wait after the leader gives up the lock before acquiring it (e.g., 2s)")
+	flag.StringVar(&config.ConsulAddr, "addr", "", "Consul address (overrides vip-manager.yml and CONSUL_HTTP_ADDR) (consul only)")
+	flag.StringVar(&config.ConsulToken, "token", "", "Consul ACL token (overrides CONSUL_HTTP_TOKEN) (consul only)")
 	flag.StringVar(&config.Hostname, "hostname", "", "Value to write to the trigger key; must match vip-manager's trigger-value (defaults to trigger-value from vip-manager.yml, then the OS hostname)")
+	flag.StringVar(&config.EtcdUser, "etcd-user", "", "etcd user, or user:password (overrides ETCDCTL_USER) (etcd only)")
+	flag.StringVar(&config.EtcdPassword, "etcd-password", "", "etcd password (overrides ETCDCTL_PASSWORD; prefer the environment variable, other local users can see flags) (etcd only)")
+	flag.StringVar(&config.EtcdCAFile, "etcd-ca-file", "", "CA certificate to verify etcd (overrides etcd-ca-file in vip-manager.yml and ETCDCTL_CACERT) (etcd only)")
+	flag.StringVar(&config.EtcdCertFile, "etcd-cert-file", "", "Client certificate for etcd (overrides ETCDCTL_CERT) (etcd only)")
+	flag.StringVar(&config.EtcdKeyFile, "etcd-key-file", "", "Private key of --etcd-cert-file (overrides ETCDCTL_KEY) (etcd only)")
 
 	flag.Parse()
+
+	config.setFlags = map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { config.setFlags[f.Name] = true })
 
 	if *versionFlag {
 		fmt.Printf("vip-elector version %s (commit: %s, date: %s, go: %s)\n", version, commit, date, runtime.Version())
@@ -215,6 +236,38 @@ func validateConfig(config *Config) error {
 	}
 	if config.LockDelay < 0 {
 		return fmt.Errorf("invalid --lock-delay: must not be negative, got %s", config.LockDelay)
+	}
+	return nil
+}
+
+// validateDCSConfig rejects an unsupported dcs-type, flags that do not apply
+// to the selected DCS, and values the selected DCS cannot express.
+func validateDCSConfig(dcsType string, config *Config) error {
+	switch {
+	case dcsType == dcsTypeConsul:
+		for _, name := range etcdOnlyFlags {
+			if config.setFlags[name] {
+				return fmt.Errorf("--%s is only used with dcs-type etcd", name)
+			}
+		}
+	case isEtcd(dcsType):
+		for _, name := range consulOnlyFlags {
+			if !config.setFlags[name] {
+				continue
+			}
+			if name == "check-id" {
+				return errors.New("--check-id is not supported with dcs-type etcd: etcd has no health checks to tie the lock to, " +
+					"so leadership follows only the vip-elector process and its connection to etcd; remove --check-id")
+			}
+			return fmt.Errorf("--%s is only used with dcs-type consul", name)
+		}
+		// etcd lease TTLs are whole seconds; rounding would silently change
+		// how fast a crashed leader is replaced.
+		if config.TTL%time.Second != 0 {
+			return fmt.Errorf("invalid --ttl: etcd lease TTLs are whole seconds, got %s", config.TTL)
+		}
+	default:
+		return fmt.Errorf("unsupported dcs-type: %s (supported: consul, etcd, etcd3)", dcsType)
 	}
 	return nil
 }
@@ -302,6 +355,17 @@ func logStartupConfig(config *Config, vipMgrConfig *VipManagerConfig) {
 		"trigger_key", vipMgrConfig.TriggerKey,
 		"check_id", config.CheckID,
 		"session_ttl", config.TTL,
+		"lock_delay", config.LockDelay,
+	)
+}
+
+func logEtcdStartupConfig(config *Config, vipMgrConfig *VipManagerConfig) {
+	slog.Info("vip-elector starting")
+	slog.Info("Configuration",
+		"dcs_type", vipMgrConfig.DCSType,
+		"dcs_endpoints", vipMgrConfig.DCSEndpoints,
+		"trigger_key", vipMgrConfig.TriggerKey,
+		"lease_ttl", config.TTL,
 		"lock_delay", config.LockDelay,
 	)
 }
