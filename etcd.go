@@ -16,6 +16,7 @@ import (
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
@@ -191,11 +192,34 @@ func etcdSettingsWarnings(s etcdSettings, vipMgrConfig *VipManagerConfig) []stri
 // etcdClientLogger returns the logger for the etcd client. Its warnings
 // (e.g. every retry while a member is unreachable) would flood the log, so
 // only errors are kept; vip-elector logs the failures that matter itself.
+//
+// The warnings are the only place that says why a connection fails (e.g. a
+// TLS certificate that is not trusted). ETCD_CLIENT_DEBUG, the etcd client's
+// own variable (a level such as "warn" or "debug"), lowers the level to show
+// them. It is read the way the etcd client reads it, which also uses it for
+// the gRPC logs.
 func etcdClientLogger() (*zap.Logger, error) {
+	level := zapcore.ErrorLevel
+	if os.Getenv("ETCD_CLIENT_DEBUG") != "" {
+		level = clientv3.ClientLogLevel()
+	}
+
 	cfg := zap.NewProductionConfig()
-	cfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
+	cfg.Level = zap.NewAtomicLevelAt(level)
 	cfg.Sampling = nil
 	return cfg.Build()
+}
+
+// etcdConnectHint explains a pre-flight read that etcd did not answer in
+// time, or returns "" for any other error. The etcd client retries until the
+// deadline and then reports only that, not why it could not connect.
+func etcdConnectHint(err error) string {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return ""
+	}
+	return "etcd did not answer: check that dcs-endpoints are reachable and, for https://, " +
+		"the CA certificate (--etcd-ca-file, etcd-ca-file, ETCDCTL_CACERT) and the client certificate; " +
+		"set ETCD_CLIENT_DEBUG=warn to see the etcd client's connection errors"
 }
 
 func createEtcdClient(s etcdSettings) (*clientv3.Client, error) {
@@ -242,6 +266,9 @@ func runEtcd(ctx context.Context, config *Config, vipMgrConfig *VipManagerConfig
 	defer client.Close()
 
 	if err := verifyEtcdKeyState(ctx, client, vipMgrConfig.TriggerKey); err != nil {
+		if hint := etcdConnectHint(err); hint != "" {
+			return fmt.Errorf("trigger-key pre-flight check failed: %w (hint: %s)", err, hint)
+		}
 		return fmt.Errorf("trigger-key pre-flight check failed: %w", err)
 	}
 
@@ -363,6 +390,20 @@ func (e *etcdElector) run(ctx context.Context) error {
 
 		err = e.campaign(ctx, leaseID, keepalive.lost)
 
+		// Report why the attempt ended before giving it up.
+		var plainKey *plainKeyError
+		retryAfter, growBackoff := backoff, true
+		switch {
+		case ctx.Err() != nil, errors.As(err, &plainKey):
+		case errors.Is(err, errLeadershipLost):
+			// Small delay before re-election to avoid tight loop
+			retryAfter, growBackoff = time.Second, false
+		case errors.Is(err, errLeaseLost):
+			slog.Warn("Lease lost while waiting for lock - Re-entering election", "lease_id", leaseHex(leaseID))
+		default:
+			slog.Error("Lock acquisition failed", "error", err)
+		}
+
 		// Giving up the attempt always revokes the lease. That deletes the
 		// key if this node holds it. If the revoke fails, the lease is
 		// retried on the next attempt, and expires with its TTL if the
@@ -375,27 +416,16 @@ func (e *etcdElector) run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-
-		var plainKey *plainKeyError
-		switch {
-		case errors.As(err, &plainKey):
+		if plainKey != nil {
 			return fmt.Errorf("lock acquisition failed: %w", err)
-		case errors.Is(err, errLeadershipLost):
-			// Small delay before re-election to avoid tight loop
-			if !sleep(time.Second) {
-				return nil
-			}
-			continue
-		case errors.Is(err, errLeaseLost):
-			slog.Warn("Lease lost while waiting for lock - Re-entering election", "lease_id", leaseHex(leaseID))
-		default:
-			slog.Error("Lock acquisition failed", "error", err)
 		}
 
-		if !sleep(backoff) {
+		if !sleep(retryAfter) {
 			return nil
 		}
-		backoff = min(backoff*2, maxBackoff)
+		if growBackoff {
+			backoff = min(backoff*2, maxBackoff)
+		}
 	}
 }
 

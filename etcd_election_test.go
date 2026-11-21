@@ -829,3 +829,12 @@ func TestVerifyEtcdKeyState(t *testing.T) {
 		})
 	}
 }
+
+func TestEtcdConnectHint(t *testing.T) {
+	if hint := etcdConnectHint(fmt.Errorf("failed to query key state: %w", context.DeadlineExceeded)); !strings.Contains(hint, "ETCD_CLIENT_DEBUG=warn") {
+		t.Errorf("expected a hint for a timeout, got %q", hint)
+	}
+	if hint := etcdConnectHint(rpctypes.ErrPermissionDenied); hint != "" {
+		t.Errorf("expected no hint for other errors, got %q", hint)
+	}
+}
