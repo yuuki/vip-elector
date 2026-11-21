@@ -37,6 +37,18 @@ jobs:
           --health-retries 10
         env:
           CONSUL_BIND_INTERFACE: eth0
+      etcd:
+        image: gcr.io/etcd-development/etcd:v3.7.4
+        ports:
+          - 2379:2379
+        # Service containers cannot override the command, so etcd is
+        # configured through the environment. The image has no shell for a
+        # health command, so readiness is checked from the runner below.
+        env:
+          ETCD_NAME: etcd
+          ETCD_DATA_DIR: /var/lib/etcd/data
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
 
     steps:
       - name: Checkout
@@ -53,7 +65,13 @@ jobs:
           timeout 30 sh -c 'until curl -sf http://localhost:8500/v1/status/leader >/dev/null; do sleep 1; done'
           echo "Consul is ready"
 
+      - name: Wait for etcd
+        run: |
+          echo "Waiting for etcd to be ready..."
+          timeout 30 sh -c 'until curl -sf http://localhost:2379/health >/dev/null; do sleep 1; done'
+          echo "etcd is ready"
+
       - name: Run E2E tests
-        run: go test -v -race -tags=e2e ./e2e/... -timeout=5m
+        run: go test -v -race -tags=e2e ./e2e/... -timeout=10m
         env:
           CONSUL_HTTP_ADDR: localhost:8500
