@@ -14,3 +14,22 @@ services:
       interval: 2s
       timeout: 1s
       retries: 10
+
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.7.4
+    container_name: vip-elector-etcd
+    ports:
+      - "2379:2379"
+    # Configured through the environment, like the etcd service in CI
+    # (GitHub service containers cannot override the command).
+    environment:
+      - ETCD_NAME=etcd
+      - ETCD_DATA_DIR=/var/lib/etcd/data
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://127.0.0.1:2379
+    healthcheck:
+      # The image has no shell, so the check is run directly.
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
