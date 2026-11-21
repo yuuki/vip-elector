@@ -10,7 +10,7 @@ before:
 builds:
   - id: vip-elector
     binary: vip-elector
-    main: ./main.go
+    main: .
     env:
       - CGO_ENABLED=0
     goos:
